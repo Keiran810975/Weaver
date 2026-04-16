@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weaver-collector"
+version = "0.1.0"
+description = "Online multi-layer information collector (daemon + python profile + CUDA/NCCL hook)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+weaver-daemon = "weaver.daemon.server:main"
+weaver-align = "weaver.analysis.timeline:main"

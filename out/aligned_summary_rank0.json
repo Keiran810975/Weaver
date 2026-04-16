@@ -1,0 +1,28 @@
+{
+  "weaver_events": 181738,
+  "profiler_events": 1171,
+  "merged_events": 182909,
+  "offset_ns": 1775078549999989000,
+  "layer_counts": {
+    "python": 181726,
+    "runtime": 12,
+    "profiler": 1103,
+    "operator": 68
+  },
+  "hardware": {
+    "platform": "macOS-26.4.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.9.6",
+    "torch": "2.8.0",
+    "cuda_available": false,
+    "cuda_device_count": 0
+  },
+  "inputs": {
+    "weaver_ndjson": "weaver_events.ndjson",
+    "profiler_trace": "out/overlap_trace_0_512_512.json"
+  },
+  "outputs": {
+    "timeline_ndjson": "out/aligned_timeline_rank0.ndjson"
+  }
+}
