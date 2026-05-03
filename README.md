@@ -157,8 +157,212 @@ CUDA launch payload includes:
 - `warp_scope=estimated`
 - `start_ns`, `end_ns`, `dur_ns`
 
+## 6) ExecutionSketch 构建（模块二：草图化预期建模）
+
+从 aligned timeline 构建轻量级执行草图，用于后续因果诊断。
+
+### 6.1 自动构建 Sketch（规则生成模式）
+
+```bash
+PYTHONPATH=. python -m weaver.sketch.builder \
+	--timeline ./out/aligned_timeline_rank0.ndjson \
+	--out ./out/execution_sketch_rank0.json
+```
+
+### 6.2 带 hints 的 Sketch 构建
+
+创建 `hints.json`:
+
+```json
+{
+  "workload": "ddp_transformer",
+  "expected_overlaps": [
+    {"left_family": "GEMM", "right_family": "NCCL", "phase": "backward"}
+  ]
+}
+```
+
+运行：
+
+```bash
+PYTHONPATH=. python -m weaver.sketch.builder \
+	--timeline ./out/aligned_timeline_rank0.ndjson \
+	--hints hints.json \
+	--out ./out/execution_sketch_rank0.json
+```
+
+### 6.3 输出 Sketch 内容
+
+Sketch 包含：
+- `kernel_templates`: Kernel 类型模板（GEMM、NCCL、MEMCPY 等）
+- `dependency_rules`: 依赖规则（same-stream、sync 等）
+- `overlap_expectations`: Overlap 期望（GEMM-NCCL 可能 overlap 等）
+
+### 6.4 在代码中使用 Sketch
+
+```python
+from weaver.sketch import SketchBuilder, KernelMatcher, classify_kernel, KernelRecord
+
+# 构建 sketch
+builder = SketchBuilder("aligned_timeline_rank0.ndjson")
+sketch = builder.build_sketch()
+
+# 检查 kernel family
+record = KernelRecord(kernel_name="ncclKernel_AllReduce", kind="nccl_all_reduce")
+kclass = classify_kernel(record)
+print(f"Family: {kclass.family}, Tag: {kclass.tag}")
+
+# Kernel 映射
+matcher = KernelMatcher(sketch)
+template = matcher.match_kernel(record)
+```
+
+详细使用文档见 [weaver/sketch/README.md](weaver/sketch/README.md)
+
+## 7) 差分式因果诊断（模块三：诊断与根因定位）
+
+从 aligned timeline 和 execution sketch 进行深度性能诊断，识别性能下降的根本原因。
+
+### 7.1 诊断工作流
+
+```bash
+PYTHONPATH=. python -m weaver.weaver.diagnose.cli \
+	--timeline ./out/aligned_timeline_rank0.ndjson \
+	--sketch ./out/execution_sketch_rank0.json \
+	--rank 0 \
+	--output ./diagnosis_rank0.json \
+	--output-html ./diagnosis_rank0.html \
+	--output-text ./diagnosis_rank0.txt \
+	--verbose
+```
+
+### 7.2 诊断流程
+
+诊断模块实现了五层分析：
+
+1. **规范化**: `Timeline` → `KernelRecord + SyncRecord + OperatorRecord`
+   - 统一多源事件格式（hook、profiler、python）
+   - 关联 CPU 和 GPU 时间轴
+   - 计算工作量和工作进度
+
+2. **候选发现**: 发现可疑的 target kernel
+   - 结构偏离: 无法分类、意外前驱、overlap 丧失
+   - 性能异常: 工作进度异常低（MAD 检测）
+   - Rank 异常: 同类比较速度显著下降
+
+3. **Slowdown 分类**: 对每个候选进行性能下降类型分类
+   - `cpu_runtime_blocked`: CPU 侧 launch 时间晚
+   - `dependency_blocked`: GPU 启动时间晚（依赖阻塞）
+   - `resource_slowed`: GPU 启动正常但执行变慢（资源竞争）
+   - `uncertain`: 信息不足
+
+4. **依赖定位**: 定位 dependency_blocked kernel 的阻塞源
+   - 查询 same-stream 前驱
+   - 检测意外前驱
+   - 计算反事实启动时间和 overlap 丧失
+
+5. **资源定位**: 定位 resource_slowed kernel 的干扰源
+   - 发现 overlap witness（>10% 重叠）
+   - Same-run differential（有/无干扰源的进度对比）
+   - Dose-response 分析（干扰强度与性能下降关联）
+
+### 7.3 诊断报告
+
+JSON 格式报告示例：
+
+```json
+{
+  "rank": 0,
+  "summary": {
+    "slowdown_type_distribution": {
+      "cpu_runtime_blocked": 5,
+      "dependency_blocked": 12,
+      "resource_slowed": 8,
+      "uncertain": 3
+    },
+    "top_blockers": [
+      {"kernel_id": "nccl_kernel", "count": 12}
+    ],
+    "top_culprits": [
+      {"kernel_id": "nccl_all_reduce", "count": 8}
+    ]
+  },
+  "targets": {
+    "k_slow_1": {
+      "slowdown": {
+        "slowdown_type": "dependency_blocked",
+        "confidence": 0.85
+      },
+      "dependency": {
+        "blocker_id": "nccl_kernel",
+        "delay_ns": 8000000,
+        "confidence": 0.9
+      }
+    }
+  }
+}
+```
+
+生成 HTML 和文本报告用于人工审查。
+
+### 7.4 在代码中使用诊断模块
+
+```python
+from weaver.weaver.diagnose import (
+    TimelineNormalizer,
+    CandidateDiscovery,
+    TimingAnalyzer,
+    DependencyLocalizer,
+    ResourceLocalizer,
+    DiagnosisReporter
+)
+from weaver.weaver.sketch import load_execution_sketch
+
+# 加载 timeline 和 sketch
+normalizer = TimelineNormalizer("aligned_timeline_rank0.ndjson")
+kernels, operators, syncs = normalizer.normalize()
+
+sketch = load_execution_sketch("execution_sketch_rank0.json")
+
+# 候选发现
+discoverer = CandidateDiscovery(sketch)
+candidates = discoverer.discover(kernels)
+
+# 性能下降分类
+analyzer = TimingAnalyzer()
+slowdown_diags = analyzer.classify_batch(kernels)
+
+# 依赖定位
+dep_localizer = DependencyLocalizer()
+dependency_diags = {
+    k: dep_localizer.localize(k, kernels, sketch)
+    for k in slowdown_diags if slowdown_diags[k].slowdown_type.value == "dependency_blocked"
+}
+
+# 资源定位
+res_localizer = ResourceLocalizer()
+resource_diags = {
+    k: res_localizer.localize(k, kernels, sketch)
+    for k in slowdown_diags if slowdown_diags[k].slowdown_type.value == "resource_slowed"
+}
+
+# 生成报告
+reporter = DiagnosisReporter(rank=0)
+report = reporter.generate_report(
+    candidates, slowdown_diags, dependency_diags, resource_diags
+)
+
+# 输出
+reporter.to_json(report, "diagnosis.json")
+reporter.to_html(report, "diagnosis.html")
+```
+
+详细文档见 [MODULE_3_COMPLETION_SUMMARY.md](../MODULE_3_COMPLETION_SUMMARY.md)
+
 ## Notes
 
+- Sketch 不存历史时间、平均 duration 或完整执行序列，只提供语义结构抽象。
+- Sketch 是模块三（差分式因果定位）的输入。
 - Warp-level fields are launch-time derived metrics (online, low overhead).
 - This prototype is collection-only and does not modify backend source code.
 - For true instruction-level warp telemetry, you can extend the hook path with a probe injector similar to Neutrino's JIT probe flow.

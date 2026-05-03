@@ -1,0 +1,208 @@
+{
+  "metadata": {
+    "schema_version": "0.1",
+    "workload": "unknown",
+    "source": "auto_from_trace",
+    "timeline_path": "./out/aligned_timeline_rank0.ndjson",
+    "num_kernel_events": 0,
+    "unique_families": [],
+    "unique_tags": []
+  },
+  "kernel_templates": [
+    {
+      "template_id": "gemm_small",
+      "family": "GEMM",
+      "tag": "GEMM_small",
+      "match": {
+        "kernel_name_regex": ".*gemm.*|.*matmul.*",
+        "operator_regex": ".*mm.*|.*matmul.*|.*linear.*"
+      },
+      "work_units": {
+        "type": "flops",
+        "value": null,
+        "formula": "2*M*N*K",
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "compute"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": true
+      }
+    },
+    {
+      "template_id": "gemm_medium",
+      "family": "GEMM",
+      "tag": "GEMM_medium",
+      "match": {
+        "kernel_name_regex": ".*gemm.*|.*matmul.*"
+      },
+      "work_units": {
+        "type": "flops",
+        "value": null,
+        "formula": "2*M*N*K",
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "compute"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": true
+      }
+    },
+    {
+      "template_id": "gemm_large",
+      "family": "GEMM",
+      "tag": "GEMM_large",
+      "match": {
+        "kernel_name_regex": ".*gemm.*|.*matmul.*"
+      },
+      "work_units": {
+        "type": "flops",
+        "value": null,
+        "formula": "2*M*N*K",
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "compute"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": true
+      }
+    },
+    {
+      "template_id": "nccl_allreduce",
+      "family": "NCCL",
+      "tag": "NCCL_allreduce_*",
+      "match": {
+        "event_kind": "nccl_all_reduce",
+        "kernel_name_regex": ".*nccl.*"
+      },
+      "work_units": {
+        "type": "bytes",
+        "value": null,
+        "formula": null,
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "communication",
+        "memory"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": true
+      }
+    },
+    {
+      "template_id": "nccl_allgather",
+      "family": "NCCL",
+      "tag": "NCCL_allgather_*",
+      "match": {
+        "event_kind": "nccl_all_gather"
+      },
+      "work_units": {
+        "type": "bytes",
+        "value": null,
+        "formula": null,
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "communication",
+        "memory"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": true
+      }
+    },
+    {
+      "template_id": "nccl_reducescatter",
+      "family": "NCCL",
+      "tag": "NCCL_reducescatter_*",
+      "match": {
+        "event_kind": "nccl_reduce_scatter"
+      },
+      "work_units": {
+        "type": "bytes",
+        "value": null,
+        "formula": null,
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "communication",
+        "memory"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": true
+      }
+    },
+    {
+      "template_id": "nccl_broadcast",
+      "family": "NCCL",
+      "tag": "NCCL_broadcast_*",
+      "match": {
+        "event_kind": "nccl_broadcast"
+      },
+      "work_units": {
+        "type": "bytes",
+        "value": null,
+        "formula": null,
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "communication",
+        "memory"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": true
+      }
+    },
+    {
+      "template_id": "memcpy",
+      "family": "MEMCPY",
+      "tag": "MEMCPY_*",
+      "match": {
+        "kernel_name_regex": ".*memcpy.*|.*copy.*"
+      },
+      "work_units": {
+        "type": "bytes",
+        "value": null,
+        "formula": null,
+        "confidence": "medium"
+      },
+      "resource_hint": [
+        "memory"
+      ],
+      "expected_behavior": {
+        "allow_overlap": true,
+        "critical": false
+      }
+    }
+  ],
+  "dependency_rules": [
+    {
+      "rule_id": "same_stream_order",
+      "type": "hard",
+      "source": "timeline",
+      "description": "kernels in the same CUDA stream preserve order"
+    },
+    {
+      "rule_id": "sync_serializes",
+      "type": "hard",
+      "source": "python_api",
+      "description": "cuda synchronize forces later GPU work to wait"
+    },
+    {
+      "rule_id": "event_wait_serializes",
+      "type": "hard",
+      "source": "timeline",
+      "description": "event wait on another stream enforces order"
+    }
+  ],
+  "overlap_expectations": []
+}
