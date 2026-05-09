@@ -17,6 +17,25 @@ from .records import KernelRecord, OperatorRecord, SyncRecord, SyncKind
 from ..sketch import classify_kernel, KernelRecord as SketchKernelRecord
 
 
+def _payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    payload = event.get("payload", {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _get(event: Dict[str, Any], key: str, default: Any = None) -> Any:
+    if key in event and event[key] is not None:
+        return event[key]
+    return _payload(event).get(key, default)
+
+
+def _get_first(event: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+    for key in keys:
+        value = _get(event, key)
+        if value is not None:
+            return value
+    return default
+
+
 class TimelineNormalizer:
     """从 aligned timeline 转换为规范化记录。"""
 
@@ -92,12 +111,23 @@ class TimelineNormalizer:
     def _is_kernel_event(self, event: Dict[str, Any]) -> bool:
         """判断是否为 kernel 事件。"""
         kind = event.get("kind", "").lower()
-        return "kernel" in kind or "hook_launch" in kind or "nccl" in kind
+        layer = event.get("layer", "").lower()
+        if layer == "neutrino":
+            return False
+        if layer == "kernel":
+            return True
+        return (
+            kind in ("kernel_launch", "kernel_launch_ex", "launch")
+            or "hook_launch" in kind
+            or kind.startswith("nccl_")
+            or (layer == "cuda" and "kernel" in kind)
+        )
 
     def _is_operator_event(self, event: Dict[str, Any]) -> bool:
         """判断是否为 operator 事件。"""
         kind = event.get("kind", "").lower()
-        return "operator" in kind or kind == "profiler_operator"
+        layer = event.get("layer", "").lower()
+        return layer == "operator" or "operator" in kind or kind == "profiler_operator"
 
     def _is_sync_event(self, event: Dict[str, Any]) -> bool:
         """判断是否为 sync 事件。"""
@@ -106,52 +136,62 @@ class TimelineNormalizer:
 
     def _convert_kernel_event(self, event: Dict[str, Any]) -> Optional[KernelRecord]:
         """将原始 kernel 事件转换为 KernelRecord。"""
-        kernel_name = event.get("kernel_name") or event.get("name") or ""
+        payload = _payload(event)
+        kernel_name = (
+            _get_first(event, ["kernel_name", "kernel", "name"])
+            or payload.get("kernel_name")
+            or payload.get("kernel")
+            or payload.get("name")
+            or ""
+        )
         if not kernel_name:
             return None
 
         # 提取基本信息
-        kid = event.get("id") or f"k_{id(event)}"
-        rank = event.get("rank")
-        pid = event.get("pid", 0)
-        tid = event.get("tid")
-        stream = event.get("stream")
+        kid = _get(event, "id") or f"k_{id(event)}"
+        rank = _get(event, "rank")
+        pid = _get(event, "pid", 0)
+        tid = _get(event, "tid")
+        stream = _get(event, "stream")
 
-        operator_name = event.get("operator_name")
-        operator_id = event.get("operator_id")
+        operator_name = _get(event, "operator_name")
+        operator_id = _get(event, "operator_id")
 
         # 时间信息：优先使用 GPU 时间
-        gpu_start_ns = event.get("gpu_start_ns") or event.get("ts_ns")
-        gpu_end_ns = event.get("gpu_end_ns")
+        gpu_start_ns = _get(event, "gpu_start_ns")
+        gpu_end_ns = _get(event, "gpu_end_ns")
         if gpu_start_ns and gpu_end_ns:
             duration_ns = gpu_end_ns - gpu_start_ns
         else:
-            duration_ns = event.get("dur_ns")
+            duration_ns = _get(event, "dur_ns")
+            if gpu_start_ns is None and event.get("layer", "").lower() == "kernel":
+                gpu_start_ns = _get(event, "ts_ns")
+                if duration_ns is not None:
+                    gpu_end_ns = gpu_start_ns + duration_ns
 
         # CPU 侧时间（来自 hook）
-        cpu_enqueue_start_ns = event.get("cpu_enqueue_start_ns") or event.get("start_ns")
-        cpu_enqueue_end_ns = event.get("cpu_enqueue_end_ns") or event.get("end_ns")
+        cpu_enqueue_start_ns = _get_first(event, ["cpu_enqueue_start_ns", "start_ns"])
+        cpu_enqueue_end_ns = _get_first(event, ["cpu_enqueue_end_ns", "end_ns"])
 
         # 执行信息
-        grid = tuple(event.get("grid", [1, 1, 1]))
-        block = tuple(event.get("block", [128, 1, 1]))
-        total_warps = event.get("total_warps")
-        shared_memory = event.get("shared_memory")
+        grid = tuple(_get(event, "grid", [1, 1, 1]))
+        block = tuple(_get(event, "block", [128, 1, 1]))
+        total_warps = _get(event, "total_warps")
+        shared_memory = _get_first(event, ["shared_memory", "shared_mem"])
 
         # 分类
         sketch_record = SketchKernelRecord(
             kernel_name=kernel_name,
             operator_name=operator_name,
             kind=event.get("kind"),
-            event_type=event.get("event_type"),
-            payload=event.get("payload", {}),
+            event_type=_get(event, "event_type"),
+            payload=payload,
             grid=grid,
             block=block,
         )
         kclass = classify_kernel(sketch_record)
 
         # 工作量
-        payload = event.get("payload", {})
         work_type = "unknown"
         work_value = None
 
@@ -191,24 +231,23 @@ class TimelineNormalizer:
             work_type=work_type,
             work_value=work_value,
             payload=payload,
-            source=event.get("source", "unknown"),
+            source=_get(event, "source", "unknown"),
         )
 
     def _convert_operator_event(self, event: Dict[str, Any]) -> Optional[OperatorRecord]:
         """将原始 operator 事件转换为 OperatorRecord。"""
-        operator_name = event.get("operator_name") or event.get("name")
+        payload = _payload(event)
+        operator_name = _get_first(event, ["operator_name", "name"]) or payload.get("operator_name")
         if not operator_name:
             return None
 
-        oid = event.get("id") or f"op_{id(event)}"
-        rank = event.get("rank")
-        pid = event.get("pid", 0)
-        phase = event.get("phase")
+        oid = _get(event, "id") or f"op_{id(event)}"
+        rank = _get(event, "rank")
+        pid = _get(event, "pid", 0)
+        phase = _get(event, "phase")
 
-        ts_start_ns = event.get("ts_ns") or event.get("start_ns") or 0
-        ts_end_ns = event.get("ts_end_ns") or event.get("end_ns")
-
-        payload = event.get("payload", {})
+        ts_start_ns = _get_first(event, ["ts_ns", "start_ns"], 0)
+        ts_end_ns = _get_first(event, ["ts_end_ns", "end_ns"])
 
         return OperatorRecord(
             oid=oid,
@@ -235,20 +274,20 @@ class TimelineNormalizer:
         else:
             kind = SyncKind.UNKNOWN_SYNC
 
-        sid = event.get("id") or f"sync_{id(event)}"
-        rank = event.get("rank")
-        pid = event.get("pid", 0)
+        sid = _get(event, "id") or f"sync_{id(event)}"
+        rank = _get(event, "rank")
+        pid = _get(event, "pid", 0)
 
-        ts_start_ns = event.get("ts_ns") or event.get("start_ns") or 0
-        ts_end_ns = event.get("ts_end_ns") or event.get("end_ns")
+        ts_start_ns = _get_first(event, ["ts_ns", "start_ns"], 0)
+        ts_end_ns = _get_first(event, ["ts_end_ns", "end_ns"])
 
         # 提取调用栈
-        stack = event.get("stack", [])
+        stack = _get(event, "stack", [])
         if isinstance(stack, str):
             stack = [stack]
 
-        payload = event.get("payload", {})
-        source = event.get("source", "unknown")
+        payload = _payload(event)
+        source = _get(event, "source", "unknown")
 
         return SyncRecord(
             sid=sid,

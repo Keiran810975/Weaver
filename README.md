@@ -17,7 +17,24 @@ Online APIs:
 - `GET /stats`
 - `GET /tail?n=200`
 
-## 2) Python layer collection
+## 2) Daemonized one-shot collection
+
+Build the hook and run the target through Weaver's launcher:
+
+```bash
+make -C hooks
+PYTHONPATH=. python -m weaver.collector.launch --out ./weaver_events.ndjson -- python your_training.py
+```
+
+The launcher starts the daemon, injects `hooks/libweaver_hook.so`, and enables CPython profile collection through `sitecustomize.py`. The target program does not need source changes.
+
+Useful environment knobs:
+- `WEAVER_PYTHON_TRACE_FUNCS`: comma-separated function filters, using the DLRover-style `module@object@function` form or plain function names.
+- `WEAVER_ENABLE_DISASM=1`: capture loaded GPU code and run the Neutrino-style disassembly sidecar.
+- `WEAVER_CUDA_EVENTS=1`: use CUDA Event start/stop records and the background poller.
+- `WEAVER_CUDA_SYNC_ANCHOR=1`: optionally synchronize a per-stream anchor to align CUDA Event times onto host time more tightly.
+
+## 3) Python layer collection
 
 ```python
 from weaver.collector import enable_python_collector
@@ -30,7 +47,7 @@ Or run demo:
 python examples/demo_python_collect.py
 ```
 
-## 3) CUDA/NCCL hook collection
+## 4) CUDA/NCCL hook collection
 
 Build hook shared object:
 
@@ -48,10 +65,11 @@ python your_training.py
 
 The hook emits online events for:
 - `cuModuleGetFunction` (kernel symbol mapping)
-- `cuLaunchKernel` (grid/block/shared mem + warp-level counts)
+- `cuLaunchKernel` (CUDA Event GPU duration + grid/block/shared mem + warp/block counts)
+- module/library binary captures and Neutrino-style disassembly summaries
 - NCCL collectives (`ncclAllReduce`, `ncclAllGather`, `ncclReduceScatter`, `ncclBroadcast`)
 
-## 4) Compute/Communication overlap sample and aligned timeline
+## 5) Compute/Communication overlap sample and aligned timeline
 
 Run overlap sample (single process by default, supports `torchrun` multi-process):
 
@@ -82,11 +100,11 @@ Alignment details:
 - Fallback: if marker match is missing, align by first timestamp boundary.
 - Output includes operator/kernel/profiler records, hook records, and hardware summary.
 
-## 5) Controlled resource contention experiments
+## 6) Controlled resource contention experiments
 
 The experiment implementation follows `experiment.md` and provides separate entries for single-node multi-GPU and multi-node multi-GPU.
 
-### 5.1 Single-node multi-GPU
+### 6.1 Single-node multi-GPU
 
 Main entry:
 
@@ -104,7 +122,7 @@ chmod +x examples/run_single_node_experiments.sh
 examples/run_single_node_experiments.sh
 ```
 
-### 5.2 Multi-node multi-GPU
+### 6.2 Multi-node multi-GPU
 
 Main entry (run on each node, with different `NODE_RANK`):
 
@@ -115,7 +133,7 @@ NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 MASTER_ADDR=10.0.0.1 MASTER_PORT=29510 \
 
 The script runs link-contention workload (`target=nccl`, `interference=link`) and emits node-local summaries.
 
-### 5.3 Experiment outputs
+### 6.3 Experiment outputs
 
 Per rank files:
 - `iter_metrics_*.csv`: per-iteration metrics
@@ -124,7 +142,7 @@ Per rank files:
 Auto-generated report:
 - `report.json`: merged quick view for slowdown/overlap/skew
 
-### 5.4 How to read results
+### 6.4 How to read results
 
 For each intensity level, compare:
 - `baseline` vs `overlap`: contention impact
@@ -157,11 +175,11 @@ CUDA launch payload includes:
 - `warp_scope=estimated`
 - `start_ns`, `end_ns`, `dur_ns`
 
-## 6) ExecutionSketch 构建（模块二：草图化预期建模）
+## 7) ExecutionSketch 构建（模块二：草图化预期建模）
 
 从 aligned timeline 构建轻量级执行草图，用于后续因果诊断。
 
-### 6.1 自动构建 Sketch（规则生成模式）
+### 7.1 自动构建 Sketch（规则生成模式）
 
 ```bash
 PYTHONPATH=. python -m weaver.sketch.builder \
@@ -169,7 +187,7 @@ PYTHONPATH=. python -m weaver.sketch.builder \
 	--out ./out/execution_sketch_rank0.json
 ```
 
-### 6.2 带 hints 的 Sketch 构建
+### 7.2 带 hints 的 Sketch 构建
 
 创建 `hints.json`:
 
@@ -191,14 +209,14 @@ PYTHONPATH=. python -m weaver.sketch.builder \
 	--out ./out/execution_sketch_rank0.json
 ```
 
-### 6.3 输出 Sketch 内容
+### 7.3 输出 Sketch 内容
 
 Sketch 包含：
 - `kernel_templates`: Kernel 类型模板（GEMM、NCCL、MEMCPY 等）
 - `dependency_rules`: 依赖规则（same-stream、sync 等）
 - `overlap_expectations`: Overlap 期望（GEMM-NCCL 可能 overlap 等）
 
-### 6.4 在代码中使用 Sketch
+### 7.4 在代码中使用 Sketch
 
 ```python
 from weaver.sketch import SketchBuilder, KernelMatcher, classify_kernel, KernelRecord
@@ -219,11 +237,11 @@ template = matcher.match_kernel(record)
 
 详细使用文档见 [weaver/sketch/README.md](weaver/sketch/README.md)
 
-## 7) 差分式因果诊断（模块三：诊断与根因定位）
+## 8) 差分式因果诊断（模块三：诊断与根因定位）
 
 从 aligned timeline 和 execution sketch 进行深度性能诊断，识别性能下降的根本原因。
 
-### 7.1 诊断工作流
+### 8.1 诊断工作流
 
 ```bash
 PYTHONPATH=. python -m weaver.weaver.diagnose.cli \
@@ -236,7 +254,7 @@ PYTHONPATH=. python -m weaver.weaver.diagnose.cli \
 	--verbose
 ```
 
-### 7.2 诊断流程
+### 8.2 诊断流程
 
 诊断模块实现了五层分析：
 
@@ -266,7 +284,7 @@ PYTHONPATH=. python -m weaver.weaver.diagnose.cli \
    - Same-run differential（有/无干扰源的进度对比）
    - Dose-response 分析（干扰强度与性能下降关联）
 
-### 7.3 诊断报告
+### 8.3 诊断报告
 
 JSON 格式报告示例：
 
@@ -305,7 +323,7 @@ JSON 格式报告示例：
 
 生成 HTML 和文本报告用于人工审查。
 
-### 7.4 在代码中使用诊断模块
+### 8.4 在代码中使用诊断模块
 
 ```python
 from weaver.weaver.diagnose import (

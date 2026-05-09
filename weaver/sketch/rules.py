@@ -100,10 +100,14 @@ def _classify_gemm(record: KernelRecord) -> KernelClass:
     name = record.kernel_name.lower()
     op = (record.operator_name or "").lower()
 
-    # 尝试从 grid/block 推断工作量
+    # 尝试从 hook/Neutrino 信息或 grid/block 推断工作量
+    payload = record.payload or {}
     grid = record.grid or (1, 1, 1)
     block = record.block or (128, 1, 1)
-    total_warps = (grid[0] * grid[1] * grid[2]) * (block[0] * block[1] * block[2] // 32)
+    total_warps = payload.get("total_warps")
+    if not total_warps:
+        block_threads = block[0] * block[1] * block[2]
+        total_warps = (grid[0] * grid[1] * grid[2]) * ((block_threads + 31) // 32)
 
     # 按工作量大小分 bucket
     if total_warps < 256:

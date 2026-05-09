@@ -12,3 +12,4 @@ dependencies = []
 [project.scripts]
 weaver-daemon = "weaver.daemon.server:main"
 weaver-align = "weaver.analysis.timeline:main"
+weaver-run = "weaver.collector.launch:main"

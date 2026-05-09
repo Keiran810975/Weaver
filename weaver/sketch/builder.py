@@ -71,12 +71,16 @@ class SketchBuilder:
         """判断是否为 kernel 或 nccl 事件。"""
         kind = record.get("kind", "").lower()
         event_type = record.get("event_type", "").lower()
+        layer = record.get("layer", "").lower()
 
+        if layer == "neutrino":
+            return False
         return (
-            "kernel" in kind or
+            kind in ("kernel_launch", "kernel_launch_ex", "launch") or
             "hook" in kind or
             "nccl" in kind or
-            "cuda" in kind or
+            layer == "kernel" or
+            (layer == "cuda" and "kernel" in kind) or
             kind.startswith("nccl_") or
             event_type.startswith("nccl_")
         )
@@ -95,25 +99,37 @@ class SketchBuilder:
 
     def _to_kernel_record(self, timeline_record: Dict[str, Any]) -> Optional[KernelRecord]:
         """将 timeline 记录转换为 KernelRecord。"""
-        kernel_name = timeline_record.get("kernel_name") or timeline_record.get("name", "")
-        operator_name = timeline_record.get("operator_name")
+        raw_payload = timeline_record.get("payload", {})
+        payload_dict = raw_payload if isinstance(raw_payload, dict) else {}
+        kernel_name = (
+            timeline_record.get("kernel_name")
+            or timeline_record.get("kernel")
+            or timeline_record.get("name")
+            or payload_dict.get("kernel_name")
+            or payload_dict.get("kernel")
+            or payload_dict.get("name")
+            or ""
+        )
+        operator_name = timeline_record.get("operator_name") or payload_dict.get("operator_name")
         kind = timeline_record.get("kind")
-        event_type = timeline_record.get("event_type")
+        event_type = timeline_record.get("event_type") or payload_dict.get("event_type")
 
         if not kernel_name:
             return None
 
-        grid = tuple(timeline_record.get("grid", [1, 1, 1]))
-        block = tuple(timeline_record.get("block", [128, 1, 1]))
-        shared_memory = timeline_record.get("shared_memory")
+        grid = tuple(timeline_record.get("grid") or payload_dict.get("grid", [1, 1, 1]))
+        block = tuple(timeline_record.get("block") or payload_dict.get("block", [128, 1, 1]))
+        shared_memory = (
+            timeline_record.get("shared_memory")
+            or timeline_record.get("shared_mem")
+            or payload_dict.get("shared_memory")
+            or payload_dict.get("shared_mem")
+        )
 
-        payload = {}
-        if "count" in timeline_record:
-            payload["count"] = timeline_record["count"]
-        if "dtype_size" in timeline_record:
-            payload["dtype_size"] = timeline_record["dtype_size"]
-        if "bytes" in timeline_record:
-            payload["bytes"] = timeline_record["bytes"]
+        payload = dict(payload_dict)
+        for key in ("count", "dtype_size", "bytes", "total_warps"):
+            if key in timeline_record:
+                payload[key] = timeline_record[key]
 
         return KernelRecord(
             kernel_name=kernel_name,
