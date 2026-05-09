@@ -157,6 +157,19 @@ Key metrics and interpretation:
 
 Use intensity sweep (`0,1,2,4...`) as dose-response evidence: if slowdown grows monotonically with intensity, contention causality is stronger.
 
+## Collection overhead experiment
+
+To validate low overhead, run the dual-GPU DDP benchmark:
+
+```bash
+PYTHONPATH=. python examples/run_overhead_experiment.py \
+	--modes baseline,weaver_full,weaver_no_disasm,torch_profiler \
+	--repeats 3 --nproc-per-node 2 --warmup 20 --iters 100 \
+	--output-dir ./overhead_out
+```
+
+It compares the same workload without collection, with Weaver's three-layer collection, with Weaver disassembly disabled, and with PyTorch profiler as a reference. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
+
 ## Event schema (high-level)
 
 All events are JSON objects over Unix datagram socket.
@@ -172,8 +185,9 @@ Top-level keys:
 CUDA launch payload includes:
 - `grid`, `block`, `shared_mem`
 - `warps_per_block`, `total_warps`
-- `warp_scope=estimated`
-- `start_ns`, `end_ns`, `dur_ns`
+- `warp_scope=block_runtime`
+- `gpu_start_ns`, `gpu_end_ns`, `gpu_duration_ns`
+- `cpu_enqueue_start_ns`, `cpu_enqueue_end_ns`
 
 ## 7) ExecutionSketch 构建（模块二：草图化预期建模）
 
