@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--skip-hook-build", action="store_true")
+    parser.add_argument("--skip-native-build", action="store_true")
     args = parser.parse_args()
     apply_preset_defaults(args)
     return args
@@ -138,6 +139,18 @@ def add_preload(env: Dict[str, str], hook: Path) -> None:
 
 def build_hook(python: str) -> None:
     subprocess.run(["make", "-C", str(ROOT / "hooks")], check=True)
+
+
+def build_native_python_trace(python: str) -> None:
+    subprocess.run(["make", "-C", str(ROOT / "weaver" / "collector"), f"PYTHON={python}"], check=True)
+
+
+def native_python_trace_path(python: str) -> Path:
+    suffix = subprocess.check_output(
+        [python, "-c", "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')"],
+        text=True,
+    ).strip()
+    return ROOT / "weaver" / "collector" / f"_native_py_trace{suffix}"
 
 
 def start_daemon(python: str, sock: Path, out_file: Path, http_port: int) -> subprocess.Popen:
@@ -203,6 +216,8 @@ def mode_env(mode: str, rep: int, run_dir: Path, sock: Optional[Path], python: s
 
     if mode in {"weaver_full", "weaver_no_disasm", "weaver_py_only"}:
         env["WEAVER_AUTO_PROFILE"] = "1"
+        env["WEAVER_PYTHON_COLLECTOR"] = "native"
+        env["WEAVER_REQUIRE_NATIVE_PY"] = "1"
         env.setdefault(
             "WEAVER_PYTHON_TRACE_FUNCS",
             "overhead_train_step,OverheadBlock.forward,weaver_overhead_forward,weaver_overhead_backward,weaver_overhead_optimizer",
@@ -213,7 +228,8 @@ def mode_env(mode: str, rep: int, run_dir: Path, sock: Optional[Path], python: s
     if needs_hook(mode):
         add_preload(env, HOOK)
         env["WEAVER_CUDA_EVENTS"] = "1"
-        env["WEAVER_CUDA_SYNC_ANCHOR"] = "1"
+        env["WEAVER_CUDA_SYNC_ANCHOR"] = "0"
+        env["WEAVER_CUDA_EVENT_POOL"] = "1"
         env["WEAVER_TRACE_DIR"] = str(run_dir / "captured_kernels")
         env["WEAVER_ENABLE_DISASM"] = "0" if mode == "weaver_no_disasm" else "1"
         env["WEAVER_PYTHON"] = python
@@ -405,8 +421,8 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
         "experiment": "weaver_three_layer_collection_overhead",
         "method": {
             "preset": args.preset,
-            "baseline": "same dual-GPU workload without daemon, CPython profile hook, or LD_PRELOAD hook",
-            "weaver_full": "daemon + CPython profile hook + LD_PRELOAD CUDA/NCCL hook + CUDA Event poller + disassembly sidecar",
+            "baseline": "same dual-GPU workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
+            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL hook + CUDA Event poller + disassembly sidecar",
             "steady_state": "warmup iterations are excluded; one-time binary capture/disassembly is expected to happen during warmup",
             "primary_metric": "median host_step_ms overhead vs baseline",
             "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes"],
@@ -466,6 +482,12 @@ def main() -> None:
             build_hook(args.python)
         if not HOOK.exists():
             raise FileNotFoundError(f"missing hook library: {HOOK}")
+    if any(mode in {"weaver_full", "weaver_no_disasm", "weaver_py_only"} for mode in modes):
+        if not args.skip_native_build:
+            build_native_python_trace(args.python)
+        native_ext = native_python_trace_path(args.python)
+        if not native_ext.exists():
+            raise FileNotFoundError(f"missing native Python tracing extension: {native_ext}")
 
     run_results: List[Dict[str, object]] = []
     for rep in range(args.repeats):

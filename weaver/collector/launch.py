@@ -60,6 +60,8 @@ def _target_env(args) -> dict:
     env = os.environ.copy()
     env["WEAVER_SOCK"] = args.sock
     env["WEAVER_AUTO_PROFILE"] = "1"
+    env.setdefault("WEAVER_PYTHON_COLLECTOR", "native")
+    env.setdefault("WEAVER_REQUIRE_NATIVE_PY", "1")
     env.setdefault(
         "WEAVER_PYTHON_TRACE_FUNCS",
         ",".join(

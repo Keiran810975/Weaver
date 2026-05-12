@@ -2,8 +2,8 @@
 
 Weaver is a pure information collector prototype that combines:
 - Daemon-based online ingestion
-- Python runtime collection via CPython profiling hook (`sys.setprofile`, backed by `PyEval_SetProfile`)
-- CUDA/NCCL collection via `LD_PRELOAD` hook on driver/runtime symbols
+- Low-overhead Python runtime collection via a native CPython `PyEval_SetProfile` callback
+- Low-overhead CUDA/NCCL collection via `LD_PRELOAD` hook on driver/runtime symbols
 - Warp-level visibility (`warps_per_block`, `total_warps`) emitted online for each kernel launch
 
 ## 1) Start daemon
@@ -23,24 +23,33 @@ Build the hook and run the target through Weaver's launcher:
 
 ```bash
 make -C hooks
+make -C weaver/collector PYTHON=$(which python)
 PYTHONPATH=. python -m weaver.collector.launch --out ./weaver_events.ndjson -- python your_training.py
 ```
 
-The launcher starts the daemon, injects `hooks/libweaver_hook.so`, and enables CPython profile collection through `sitecustomize.py`. The target program does not need source changes.
+The launcher starts the daemon, injects `hooks/libweaver_hook.so`, and enables the native CPython profile collector through `sitecustomize.py`. The target program does not need source changes.
 
 Useful environment knobs:
 - `WEAVER_PYTHON_TRACE_FUNCS`: comma-separated function filters, using the DLRover-style `module@object@function` form or plain function names.
+- `WEAVER_PYTHON_COLLECTOR=native`: use the Flare/DLRover-style native C profile callback; `python` keeps the older pure-Python fallback for debugging.
+- `WEAVER_REQUIRE_NATIVE_PY=1`: fail fast if the native collector was not built, instead of silently falling back.
 - `WEAVER_PYTHON_SAMPLE_RATE`: sample every N matched Python operator calls; keep `1` for a full Python trace.
 - `WEAVER_TRACE_GC=0/1`: disable or enable Python GC pause events.
 - `WEAVER_ENABLE_DISASM=1`: capture loaded GPU code and run the Neutrino-style disassembly sidecar.
 - `WEAVER_CUDA_EVENTS=1`: use CUDA Event start/stop records and the background poller.
+- `WEAVER_CUDA_EVENT_POOL=1`: reuse CUDA Event pairs across launches to avoid per-launch create/destroy overhead.
 - `WEAVER_CUDA_SYNC_ANCHOR=1`: optionally synchronize a per-stream anchor to align CUDA Event times onto host time more tightly.
 
 ## 3) Python layer collection
 
 ```python
 from weaver.collector import enable_python_collector
-enable_python_collector(socket_path="/tmp/weaver.sock", sample_rate=1)
+enable_python_collector(
+    socket_path="/tmp/weaver.sock",
+    targets=("train_step",),
+    sample_rate=1,
+    backend="native",
+)
 ```
 
 Or run demo:

@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from types import FrameType
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 
 @dataclass
@@ -233,7 +233,48 @@ class PythonRuntimeCollector:
         self._enabled = False
 
 
-_global_collector: Optional[PythonRuntimeCollector] = None
+class NativePythonRuntimeCollector:
+    """Low-overhead CPython collector implemented in C.
+
+    The native backend follows the Flare/DLRover shape: PyEval_SetProfile runs a
+    C callback, target functions are cached by code-object address, and records
+    are buffered in a native queue before a background flusher writes to Weaver.
+    """
+
+    def __init__(self, config: Optional[PythonCollectorConfig] = None):
+        self.cfg = config or PythonCollectorConfig()
+        self._enabled = False
+        self._native = None
+
+    def start(self):
+        if self._enabled:
+            return
+        if not self.cfg.targets:
+            raise RuntimeError("native Python tracing requires WEAVER_PYTHON_TRACE_FUNCS targets")
+        from . import _native_py_trace
+
+        queue_size = max(1024, int(os.environ.get("WEAVER_NATIVE_PY_QUEUE_SIZE", "65536")))
+        _native_py_trace.start(
+            sock_path=self.cfg.socket_path,
+            targets=self.cfg.targets,
+            sample_rate=max(1, int(self.cfg.sample_rate)),
+            queue_size=queue_size,
+        )
+        self._native = _native_py_trace
+        self._enabled = True
+
+    def stop(self):
+        if not self._enabled:
+            return
+        if self._native is not None:
+            self._native.stop()
+        self._enabled = False
+
+
+CollectorHandle = Union[PythonRuntimeCollector, NativePythonRuntimeCollector]
+
+
+_global_collector: Optional[CollectorHandle] = None
 
 
 def enable_python_collector(
@@ -243,25 +284,38 @@ def enable_python_collector(
     targets: Tuple[str, ...] = (),
     trace_gc: bool = True,
     emit_raw_calls: bool = False,
-) -> PythonRuntimeCollector:
+    backend: Optional[str] = None,
+) -> CollectorHandle:
     global _global_collector
     if _global_collector is None:
-        _global_collector = PythonRuntimeCollector(
-            PythonCollectorConfig(
-                socket_path=socket_path,
-                sample_rate=sample_rate,
-                include_stdlib=include_stdlib,
-                targets=targets,
-                trace_gc=trace_gc,
-                emit_raw_calls=emit_raw_calls,
-            )
+        cfg = PythonCollectorConfig(
+            socket_path=socket_path,
+            sample_rate=sample_rate,
+            include_stdlib=include_stdlib,
+            targets=targets,
+            trace_gc=trace_gc,
+            emit_raw_calls=emit_raw_calls,
         )
-        _global_collector.start()
+        selected = (backend or os.environ.get("WEAVER_PYTHON_COLLECTOR", "native")).lower()
+        require_native = os.environ.get("WEAVER_REQUIRE_NATIVE_PY", "0") in ("1", "true", "TRUE", "on", "ON")
+        if selected in ("native", "flare") and require_native and not targets:
+            raise RuntimeError("native Python tracing requires non-empty WEAVER_PYTHON_TRACE_FUNCS")
+        if selected in ("native", "flare", "auto") and targets:
+            try:
+                _global_collector = NativePythonRuntimeCollector(cfg)
+                _global_collector.start()
+            except Exception:
+                _global_collector = None
+                if require_native or selected in ("native", "flare"):
+                    raise
+        if _global_collector is None:
+            _global_collector = PythonRuntimeCollector(cfg)
+            _global_collector.start()
         atexit.register(_global_collector.stop)
     return _global_collector
 
 
-def enable_from_env() -> Optional[PythonRuntimeCollector]:
+def enable_from_env() -> Optional[CollectorHandle]:
     """Enable the collector from sitecustomize/launcher environment settings."""
     if os.environ.get("WEAVER_AUTO_PROFILE", "0") not in ("1", "true", "TRUE", "on", "ON"):
         return None
@@ -277,4 +331,5 @@ def enable_from_env() -> Optional[PythonRuntimeCollector]:
         targets=targets,
         trace_gc=os.environ.get("WEAVER_TRACE_GC", "1") not in ("0", "false", "FALSE"),
         emit_raw_calls=os.environ.get("WEAVER_PROFILE_RAW_CALLS", "0") in ("1", "true", "TRUE"),
+        backend=os.environ.get("WEAVER_PYTHON_COLLECTOR", "native"),
     )

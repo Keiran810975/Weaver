@@ -149,6 +149,7 @@ static int g_poller_started = 0;
 static int g_should_run = 1;
 static int g_cuda_event_enabled = 1;
 static int g_sync_stream_anchor = 0;
+static int g_cuda_event_pool_enabled = 1;
 static unsigned long long g_launch_seq = 0;
 
 struct code_item {
@@ -177,6 +178,7 @@ struct launch_item {
     CUstream stream;
     CUevent start_event;
     CUevent end_event;
+    struct event_pair* event_pair;
     struct stream_anchor* anchor;
     unsigned int grid[3];
     unsigned int block[3];
@@ -188,9 +190,18 @@ struct launch_item {
     struct launch_item* next;
 };
 
+struct event_pair {
+    CUevent start_event;
+    CUevent end_event;
+    struct event_pair* next;
+};
+
 static struct code_item* g_code_map = NULL;
 static struct stream_anchor* g_anchors = NULL;
 static struct launch_item* g_pending = NULL;
+static struct event_pair* g_event_pool = NULL;
+
+static int cuda_events_ready(void);
 
 static long long now_ns(void) {
     struct timespec ts;
@@ -680,6 +691,100 @@ static struct stream_anchor* get_stream_anchor(CUstream stream) {
     return anchor;
 }
 
+static struct event_pair* acquire_event_pair(CUevent* start_event, CUevent* end_event) {
+    *start_event = NULL;
+    *end_event = NULL;
+    if (!cuda_events_ready()) {
+        return NULL;
+    }
+
+    struct event_pair* pair = NULL;
+    if (g_cuda_event_pool_enabled) {
+        pthread_mutex_lock(&g_map_lock);
+        pair = g_event_pool;
+        if (pair) {
+            g_event_pool = pair->next;
+        }
+        pthread_mutex_unlock(&g_map_lock);
+        if (pair) {
+            pair->next = NULL;
+            *start_event = pair->start_event;
+            *end_event = pair->end_event;
+            return pair;
+        }
+    }
+
+    pair = (struct event_pair*)calloc(1, sizeof(*pair));
+    if (!pair) {
+        return NULL;
+    }
+    if (real_cuEventCreate(&pair->start_event, CU_EVENT_DEFAULT) != CU_SUCCESS) {
+        *start_event = NULL;
+        free(pair);
+        return NULL;
+    }
+    if (real_cuEventCreate(&pair->end_event, CU_EVENT_DEFAULT) != CU_SUCCESS) {
+        if (real_cuEventDestroy && pair->start_event) {
+            real_cuEventDestroy(pair->start_event);
+        }
+        *start_event = NULL;
+        *end_event = NULL;
+        free(pair);
+        return NULL;
+    }
+    *start_event = pair->start_event;
+    *end_event = pair->end_event;
+    return pair;
+}
+
+static void release_event_pair(struct event_pair* pair, int destroy) {
+    if (!pair) {
+        return;
+    }
+    if (!destroy && g_cuda_event_pool_enabled && pair->start_event && pair->end_event) {
+        pthread_mutex_lock(&g_map_lock);
+        pair->next = g_event_pool;
+        g_event_pool = pair;
+        pthread_mutex_unlock(&g_map_lock);
+        return;
+    }
+    if (real_cuEventDestroy) {
+        if (pair->start_event) {
+            real_cuEventDestroy(pair->start_event);
+        }
+        if (pair->end_event) {
+            real_cuEventDestroy(pair->end_event);
+        }
+    }
+    free(pair);
+}
+
+static struct event_pair* begin_event_timing(CUstream stream, CUevent* start_event, CUevent* end_event) {
+    struct event_pair* pair = acquire_event_pair(start_event, end_event);
+    if (!pair) {
+        return NULL;
+    }
+    if (real_cuEventRecord(*start_event, stream) == CU_SUCCESS) {
+        return pair;
+    }
+    release_event_pair(pair, 1);
+    *start_event = NULL;
+    *end_event = NULL;
+    return NULL;
+}
+
+static void destroy_event_pool(void) {
+    pthread_mutex_lock(&g_map_lock);
+    struct event_pair* pair = g_event_pool;
+    g_event_pool = NULL;
+    pthread_mutex_unlock(&g_map_lock);
+    while (pair) {
+        struct event_pair* next = pair->next;
+        release_event_pair(pair, 1);
+        pair = next;
+    }
+}
+
 static void emit_kernel_launch(struct launch_item* item, long long ready_ns,
                                long long gpu_duration_ns, long long gpu_start_ns,
                                long long gpu_end_ns, const char* alignment) {
@@ -705,14 +810,7 @@ static void destroy_launch_item(struct launch_item* item) {
     if (!item) {
         return;
     }
-    if (real_cuEventDestroy) {
-        if (item->start_event) {
-            real_cuEventDestroy(item->start_event);
-        }
-        if (item->end_event) {
-            real_cuEventDestroy(item->end_event);
-        }
-    }
+    release_event_pair(item->event_pair, 0);
     free(item->kernel_name);
     free(item);
 }
@@ -815,6 +913,7 @@ static void init_runtime(void) {
     signal(SIGCHLD, SIG_IGN);
     g_cuda_event_enabled = env_flag("WEAVER_CUDA_EVENTS", 1);
     g_sync_stream_anchor = env_flag("WEAVER_CUDA_SYNC_ANCHOR", 0);
+    g_cuda_event_pool_enabled = env_flag("WEAVER_CUDA_EVENT_POOL", 1);
 
     const char* sock = getenv("WEAVER_SOCK");
     if (!sock || !sock[0]) {
@@ -833,9 +932,10 @@ static void init_runtime(void) {
     }
 
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
         now_ns(), getpid(), (unsigned long long)pthread_self(),
         cuda_events_ready() ? "true" : "false", g_sync_stream_anchor ? "true" : "false",
+        g_cuda_event_pool_enabled ? "true" : "false",
         real_cuLaunchKernel ? "true" : "false",
         real_cudaLaunchKernel ? "true" : "false",
         real_cuGetProcAddress ? "true" : "false",
@@ -856,6 +956,7 @@ __attribute__((destructor)) static void weaver_fini(void) {
     if (g_poller_started) {
         pthread_join(g_poller, NULL);
     }
+    destroy_event_pool();
     if (g_sock >= 0) {
         close(g_sock);
         g_sock = -1;
@@ -1062,10 +1163,8 @@ static CUresult handle_launch(CUfunction f,
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    int use_events = cuda_events_ready() &&
-                     real_cuEventCreate(&start_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventCreate(&end_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventRecord(start_event, hStream) == CU_SUCCESS;
+    struct event_pair* event_pair = begin_event_timing(hStream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
     if (use_events) {
         anchor = get_stream_anchor(hStream);
     }
@@ -1085,6 +1184,7 @@ static CUresult handle_launch(CUfunction f,
         item->stream = hStream;
         item->start_event = start_event;
         item->end_event = end_event;
+        item->event_pair = event_pair;
         item->anchor = anchor;
         item->grid[0] = gridDimX;
         item->grid[1] = gridDimY;
@@ -1119,14 +1219,7 @@ static CUresult handle_launch(CUfunction f,
         item.cpu_enqueue_end_ns = cpu_end;
         emit_kernel_launch(&item, cpu_end, cpu_end - cpu_start, cpu_start, cpu_end,
                            "cpu_enqueue_fallback");
-        if (real_cuEventDestroy) {
-            if (start_event) {
-                real_cuEventDestroy(start_event);
-            }
-            if (end_event) {
-                real_cuEventDestroy(end_event);
-            }
-        }
+        release_event_pair(event_pair, 1);
         free(name);
     }
     return ret;
@@ -1202,10 +1295,8 @@ static CUresult handle_launch_ex(const CUlaunchConfig* config,
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    int use_events = cuda_events_ready() &&
-                     real_cuEventCreate(&start_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventCreate(&end_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventRecord(start_event, config->hStream) == CU_SUCCESS;
+    struct event_pair* event_pair = begin_event_timing(config->hStream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
     if (use_events) {
         anchor = get_stream_anchor(config->hStream);
     }
@@ -1223,6 +1314,7 @@ static CUresult handle_launch_ex(const CUlaunchConfig* config,
         item->stream = config->hStream;
         item->start_event = start_event;
         item->end_event = end_event;
+        item->event_pair = event_pair;
         item->anchor = anchor;
         item->grid[0] = config->gridDimX;
         item->grid[1] = config->gridDimY;
@@ -1256,14 +1348,7 @@ static CUresult handle_launch_ex(const CUlaunchConfig* config,
         item.cpu_enqueue_start_ns = cpu_start;
         item.cpu_enqueue_end_ns = cpu_end;
         emit_kernel_launch(&item, cpu_end, cpu_end - cpu_start, cpu_start, cpu_end, api_name);
-        if (real_cuEventDestroy) {
-            if (start_event) {
-                real_cuEventDestroy(start_event);
-            }
-            if (end_event) {
-                real_cuEventDestroy(end_event);
-            }
-        }
+        release_event_pair(event_pair, 1);
         free(name);
     }
     return ret;
@@ -1311,10 +1396,8 @@ static cudaError_t handle_runtime_launch(const void* func,
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    int use_events = cuda_events_ready() &&
-                     real_cuEventCreate(&start_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventCreate(&end_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventRecord(start_event, (CUstream)stream) == CU_SUCCESS;
+    struct event_pair* event_pair = begin_event_timing((CUstream)stream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
     if (use_events) {
         anchor = get_stream_anchor((CUstream)stream);
     }
@@ -1332,6 +1415,7 @@ static cudaError_t handle_runtime_launch(const void* func,
         item->stream = (CUstream)stream;
         item->start_event = start_event;
         item->end_event = end_event;
+        item->event_pair = event_pair;
         item->anchor = anchor;
         item->grid[0] = gridDim.x;
         item->grid[1] = gridDim.y;
@@ -1365,14 +1449,7 @@ static cudaError_t handle_runtime_launch(const void* func,
         item.cpu_enqueue_start_ns = cpu_start;
         item.cpu_enqueue_end_ns = cpu_end;
         emit_kernel_launch(&item, cpu_end, cpu_end - cpu_start, cpu_start, cpu_end, api_name);
-        if (real_cuEventDestroy) {
-            if (start_event) {
-                real_cuEventDestroy(start_event);
-            }
-            if (end_event) {
-                real_cuEventDestroy(end_event);
-            }
-        }
+        release_event_pair(event_pair, 1);
         free(name);
     }
     return ret;
@@ -1469,10 +1546,8 @@ static cudaError_t handle_runtime_launch_ex(const cudaLaunchConfig_runtime* conf
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    int use_events = cuda_events_ready() &&
-                     real_cuEventCreate(&start_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventCreate(&end_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
-                     real_cuEventRecord(start_event, (CUstream)config->stream) == CU_SUCCESS;
+    struct event_pair* event_pair = begin_event_timing((CUstream)config->stream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
     if (use_events) {
         anchor = get_stream_anchor((CUstream)config->stream);
     }
@@ -1490,6 +1565,7 @@ static cudaError_t handle_runtime_launch_ex(const cudaLaunchConfig_runtime* conf
         item->stream = (CUstream)config->stream;
         item->start_event = start_event;
         item->end_event = end_event;
+        item->event_pair = event_pair;
         item->anchor = anchor;
         item->grid[0] = config->gridDim.x;
         item->grid[1] = config->gridDim.y;
@@ -1523,14 +1599,7 @@ static cudaError_t handle_runtime_launch_ex(const cudaLaunchConfig_runtime* conf
         item.cpu_enqueue_start_ns = cpu_start;
         item.cpu_enqueue_end_ns = cpu_end;
         emit_kernel_launch(&item, cpu_end, cpu_end - cpu_start, cpu_start, cpu_end, api_name);
-        if (real_cuEventDestroy) {
-            if (start_event) {
-                real_cuEventDestroy(start_event);
-            }
-            if (end_event) {
-                real_cuEventDestroy(end_event);
-            }
-        }
+        release_event_pair(event_pair, 1);
         free(name);
     }
     return ret;

@@ -2,8 +2,8 @@
 
 This experiment measures the steady-state cost of Weaver's three-layer collector:
 
-1. CPython profile-hook operator collection.
-2. LD_PRELOAD CUDA/NCCL launch interception with CUDA Event timing and async polling.
+1. Native CPython `PyEval_SetProfile` operator collection with code-object address matching.
+2. LD_PRELOAD CUDA/NCCL launch interception with CUDA Event timing, event-pair reuse, and async polling.
 3. Neutrino-style hook-after binary capture plus PTX/SASS disassembly sidecar.
 
 ## Core Idea
@@ -11,7 +11,7 @@ This experiment measures the steady-state cost of Weaver's three-layer collector
 Run the exact same dual-GPU DDP training workload under several modes:
 
 - `baseline`: no daemon, no CPython profile hook, no LD_PRELOAD hook.
-- `weaver_full`: daemon + CPython hook + CUDA/NCCL hook + CUDA Event poller + disassembly sidecar.
+- `weaver_full`: daemon + native CPython hook + CUDA/NCCL hook + CUDA Event poller + disassembly sidecar.
 - `weaver_no_disasm`: same as Weaver, but disables one-time binary disassembly to isolate steady-state online cost.
 - `torch_profiler`: PyTorch profiler reference mode.
 
@@ -23,11 +23,11 @@ overhead_pct = (median_step_ms(mode) - median_step_ms(baseline)) / median_step_m
 
 GPU Event step time, p95 step time, event count, and emitted event bytes are secondary metrics. Warmup iterations are excluded so one-time kernel capture/disassembly is amortized, which matches the intended online usage.
 
-By default the Weaver Python layer samples every 10 matched operator calls
-(`--python-sample-rate 10`) and disables GC events for this benchmark. Use
-`--python-sample-rate 1` when you want a full Python operator trace; that mode is
-expected to cost more because CPython invokes the profile callback on every
-Python call/return.
+By default the Weaver Python layer uses the native C collector, samples every 10
+matched operator calls (`--python-sample-rate 10`), and disables GC events for
+this benchmark. Use `--python-sample-rate 1` when you want a full Python operator
+trace. The pure-Python collector is kept only as a debugging fallback because it
+is not the low-overhead Flare-style path.
 
 ## Workload
 
