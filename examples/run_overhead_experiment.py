@@ -30,6 +30,7 @@ PRESETS = {
         "layers": 3,
         "explicit_comm_mb": 16,
         "profiler_active": 5,
+        "python_sample_rate": 10,
     },
     "paper": {
         "output_dir": "./overhead_out",
@@ -45,6 +46,7 @@ PRESETS = {
         "layers": 6,
         "explicit_comm_mb": 64,
         "profiler_active": 10,
+        "python_sample_rate": 10,
     },
 }
 
@@ -74,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler-record-shapes", action="store_true")
     parser.add_argument("--profiler-profile-memory", action="store_true")
     parser.add_argument("--profiler-with-stack", action="store_true")
+    parser.add_argument(
+        "--python-sample-rate",
+        type=int,
+        help="sample every N matched Python operator calls in Weaver Python modes; use 1 for a full Python trace",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--skip-hook-build", action="store_true")
     args = parser.parse_args()
@@ -181,7 +188,7 @@ def needs_hook(mode: str) -> bool:
     return mode in {"weaver_full", "weaver_no_disasm", "weaver_kernel_only"}
 
 
-def mode_env(mode: str, rep: int, run_dir: Path, sock: Optional[Path], python: str) -> Dict[str, str]:
+def mode_env(mode: str, rep: int, run_dir: Path, sock: Optional[Path], python: str, python_sample_rate: int) -> Dict[str, str]:
     env = os.environ.copy()
     prepend_path(env, "PYTHONPATH", str(ROOT))
     env["WEAVER_OVERHEAD_MODE"] = mode
@@ -200,7 +207,8 @@ def mode_env(mode: str, rep: int, run_dir: Path, sock: Optional[Path], python: s
             "WEAVER_PYTHON_TRACE_FUNCS",
             "overhead_train_step,OverheadBlock.forward,weaver_overhead_forward,weaver_overhead_backward,weaver_overhead_optimizer",
         )
-        env.setdefault("WEAVER_TRACE_GC", "1")
+        env.setdefault("WEAVER_PYTHON_SAMPLE_RATE", str(max(1, python_sample_rate)))
+        env.setdefault("WEAVER_TRACE_GC", "0")
 
     if needs_hook(mode):
         add_preload(env, HOOK)
@@ -301,7 +309,7 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
             daemon = start_daemon(args.python, sock, weaver_file, args.base_http_port + rep)
             wait_for_socket(sock)
 
-        env = mode_env(mode, rep, run_dir, sock, args.python)
+        env = mode_env(mode, rep, run_dir, sock, args.python, args.python_sample_rate)
         cmd = workload_cmd(args, mode, rep, out_dir)
         log_path = run_dir / "torchrun.log"
         started = time.perf_counter()

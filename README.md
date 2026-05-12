@@ -30,6 +30,8 @@ The launcher starts the daemon, injects `hooks/libweaver_hook.so`, and enables C
 
 Useful environment knobs:
 - `WEAVER_PYTHON_TRACE_FUNCS`: comma-separated function filters, using the DLRover-style `module@object@function` form or plain function names.
+- `WEAVER_PYTHON_SAMPLE_RATE`: sample every N matched Python operator calls; keep `1` for a full Python trace.
+- `WEAVER_TRACE_GC=0/1`: disable or enable Python GC pause events.
 - `WEAVER_ENABLE_DISASM=1`: capture loaded GPU code and run the Neutrino-style disassembly sidecar.
 - `WEAVER_CUDA_EVENTS=1`: use CUDA Event start/stop records and the background poller.
 - `WEAVER_CUDA_SYNC_ANCHOR=1`: optionally synchronize a per-stream anchor to align CUDA Event times onto host time more tightly.
@@ -65,9 +67,10 @@ python your_training.py
 
 The hook emits online events for:
 - `cuModuleGetFunction` (kernel symbol mapping)
-- `cuLaunchKernel` (CUDA Event GPU duration + grid/block/shared mem + warp/block counts)
-- `cudaLaunchKernel`, `cudaLaunchKernelExC`, and `cudaLaunchCooperativeKernel` for CUDA Runtime API launches
-- `cuGetProcAddress` so libraries that resolve `cuLaunchKernel` dynamically still route through the hook
+- `cuLaunchKernel`, `cuLaunchKernelEx`, and their `_ptsz` variants (CUDA Event GPU duration + grid/block/shared mem + warp/block counts)
+- `cudaLaunchKernel`, `cudaLaunchKernelExC`, `cudaLaunchCooperativeKernel`, and their `_ptsz` variants for CUDA Runtime API launches
+- `cuGetProcAddress`/`cuGetProcAddress_v2` so libraries that resolve CUDA driver symbols dynamically still route through the hook
+- `cuFuncGetName` fallback naming for driver kernels when module/function name mapping is unavailable
 - module/library binary captures and Neutrino-style disassembly summaries
 - NCCL collectives (`ncclAllReduce`, `ncclAllGather`, `ncclReduceScatter`, `ncclBroadcast`)
 
@@ -170,6 +173,8 @@ PYTHONPATH=. python examples/run_overhead_experiment.py \
 ```
 
 The quick preset is sized for a 2xV100 node and should finish in roughly five minutes or less. It compares the same workload without collection, with Weaver's three-layer collection, and with Weaver disassembly disabled. `torch_profiler` remains available as an optional reference mode. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
+
+The quick preset uses sampled Python operator collection (`--python-sample-rate 10`). Use `--python-sample-rate 1` to measure the full Python profile trace separately from the low-overhead setting.
 
 ## Event schema (high-level)
 

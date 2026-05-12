@@ -74,6 +74,7 @@ typedef CUresult (*cuKernelGetFunction_t)(CUfunction*, CUkernel);
 typedef CUresult (*cuLibraryLoadData_t)(CUlibrary*, const void*, void*, void**, unsigned int, void*, void**, unsigned int);
 typedef CUresult (*cuLibraryGetKernel_t)(CUkernel*, CUlibrary, const char*);
 typedef CUresult (*cuLibraryGetModule_t)(CUmodule*, CUlibrary);
+typedef CUresult (*cuFuncGetName_t)(const char**, CUfunction);
 typedef CUresult (*cuLaunchKernel_t)(CUfunction, unsigned int, unsigned int,
                                      unsigned int, unsigned int, unsigned int,
                                      unsigned int, unsigned int, CUstream,
@@ -112,8 +113,11 @@ static cuKernelGetFunction_t real_cuKernelGetFunction = NULL;
 static cuLibraryLoadData_t real_cuLibraryLoadData = NULL;
 static cuLibraryGetKernel_t real_cuLibraryGetKernel = NULL;
 static cuLibraryGetModule_t real_cuLibraryGetModule = NULL;
+static cuFuncGetName_t real_cuFuncGetName = NULL;
 static cuLaunchKernel_t real_cuLaunchKernel = NULL;
+static cuLaunchKernel_t real_cuLaunchKernel_ptsz = NULL;
 static cuLaunchKernelEx_t real_cuLaunchKernelEx = NULL;
+static cuLaunchKernelEx_t real_cuLaunchKernelEx_ptsz = NULL;
 static cuEventCreate_t real_cuEventCreate = NULL;
 static cuEventRecord_t real_cuEventRecord = NULL;
 static cuEventQuery_t real_cuEventQuery = NULL;
@@ -121,9 +125,13 @@ static cuEventSynchronize_t real_cuEventSynchronize = NULL;
 static cuEventElapsedTime_t real_cuEventElapsedTime = NULL;
 static cuEventDestroy_t real_cuEventDestroy = NULL;
 static cuGetProcAddress_t real_cuGetProcAddress = NULL;
+static cuGetProcAddress_t real_cuGetProcAddress_v2 = NULL;
 static cudaLaunchKernel_runtime_t real_cudaLaunchKernel = NULL;
+static cudaLaunchKernel_runtime_t real_cudaLaunchKernel_ptsz = NULL;
 static cudaLaunchKernelExC_t real_cudaLaunchKernelExC = NULL;
+static cudaLaunchKernelExC_t real_cudaLaunchKernelExC_ptsz = NULL;
 static cudaLaunchCooperativeKernel_t real_cudaLaunchCooperativeKernel = NULL;
+static cudaLaunchCooperativeKernel_t real_cudaLaunchCooperativeKernel_ptsz = NULL;
 
 static ncclAllReduce_t real_ncclAllReduce = NULL;
 static ncclAllGather_t real_ncclAllGather = NULL;
@@ -232,11 +240,20 @@ static void refresh_driver_symbols(void) {
     if (!real_cuLibraryGetModule) {
         real_cuLibraryGetModule = (cuLibraryGetModule_t)dlsym_next_any("cuLibraryGetModule", NULL);
     }
+    if (!real_cuFuncGetName) {
+        real_cuFuncGetName = (cuFuncGetName_t)dlsym_next_any("cuFuncGetName", NULL);
+    }
     if (!real_cuLaunchKernel) {
         real_cuLaunchKernel = (cuLaunchKernel_t)dlsym_next_any("cuLaunchKernel", NULL);
     }
+    if (!real_cuLaunchKernel_ptsz) {
+        real_cuLaunchKernel_ptsz = (cuLaunchKernel_t)dlsym_next_any("cuLaunchKernel_ptsz", NULL);
+    }
     if (!real_cuLaunchKernelEx) {
         real_cuLaunchKernelEx = (cuLaunchKernelEx_t)dlsym_next_any("cuLaunchKernelEx", NULL);
+    }
+    if (!real_cuLaunchKernelEx_ptsz) {
+        real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)dlsym_next_any("cuLaunchKernelEx_ptsz", NULL);
     }
     if (!real_cuEventCreate) {
         real_cuEventCreate = (cuEventCreate_t)dlsym_next_any("cuEventCreate", NULL);
@@ -259,18 +276,31 @@ static void refresh_driver_symbols(void) {
     if (!real_cuGetProcAddress) {
         real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress", NULL);
     }
+    if (!real_cuGetProcAddress_v2) {
+        real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress_v2", NULL);
+    }
 }
 
 static void refresh_runtime_symbols(void) {
     if (!real_cudaLaunchKernel) {
         real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)dlsym_next_any("cudaLaunchKernel", NULL);
     }
+    if (!real_cudaLaunchKernel_ptsz) {
+        real_cudaLaunchKernel_ptsz = (cudaLaunchKernel_runtime_t)dlsym_next_any("cudaLaunchKernel_ptsz", NULL);
+    }
     if (!real_cudaLaunchKernelExC) {
         real_cudaLaunchKernelExC = (cudaLaunchKernelExC_t)dlsym_next_any("cudaLaunchKernelExC", NULL);
+    }
+    if (!real_cudaLaunchKernelExC_ptsz) {
+        real_cudaLaunchKernelExC_ptsz = (cudaLaunchKernelExC_t)dlsym_next_any("cudaLaunchKernelExC_ptsz", NULL);
     }
     if (!real_cudaLaunchCooperativeKernel) {
         real_cudaLaunchCooperativeKernel =
             (cudaLaunchCooperativeKernel_t)dlsym_next_any("cudaLaunchCooperativeKernel", NULL);
+    }
+    if (!real_cudaLaunchCooperativeKernel_ptsz) {
+        real_cudaLaunchCooperativeKernel_ptsz =
+            (cudaLaunchCooperativeKernel_t)dlsym_next_any("cudaLaunchCooperativeKernel_ptsz", NULL);
     }
 }
 
@@ -481,12 +511,44 @@ static void code_copy_key(void* old_key, void* new_key, const char* name) {
     pthread_mutex_unlock(&g_map_lock);
 }
 
+static void code_set_name(void* key, const char* name) {
+    if (!key || !name || !name[0]) {
+        return;
+    }
+    pthread_mutex_lock(&g_map_lock);
+    struct code_item* item = code_find_locked(key);
+    if (!item) {
+        item = (struct code_item*)calloc(1, sizeof(*item));
+        item->key = key;
+        item->next = g_code_map;
+        g_code_map = item;
+    }
+    if (!item->name || strcmp(item->name, name) != 0) {
+        free(item->name);
+        item->name = strdup(name);
+    }
+    pthread_mutex_unlock(&g_map_lock);
+}
+
 static char* code_name_for(CUfunction func) {
     pthread_mutex_lock(&g_map_lock);
     struct code_item* item = code_find_locked(func);
-    char* ret = item && item->name ? strdup(item->name) : strdup("<unknown>");
+    char* ret = item && item->name ? strdup(item->name) : NULL;
     pthread_mutex_unlock(&g_map_lock);
-    return ret;
+    if (ret) {
+        return ret;
+    }
+
+    refresh_driver_symbols();
+    if (func && real_cuFuncGetName) {
+        const char* driver_name = NULL;
+        if (real_cuFuncGetName(&driver_name, func) == CU_SUCCESS &&
+            driver_name && driver_name[0]) {
+            code_set_name(func, driver_name);
+            return strdup(driver_name);
+        }
+    }
+    return strdup("<unknown>");
 }
 
 static char* runtime_name_for(const void* func) {
@@ -956,6 +1018,25 @@ CUresult cuLibraryGetModule(CUmodule* pMod, CUlibrary library) {
     return ret;
 }
 
+CUresult cuFuncGetName(const char** name, CUfunction hfunc) {
+    init_once();
+    refresh_driver_symbols();
+    if (!real_cuFuncGetName) {
+        return 1;
+    }
+    CUresult ret = real_cuFuncGetName(name, hfunc);
+    if (ret == CU_SUCCESS && name && *name) {
+        code_set_name(hfunc, *name);
+    }
+    char escaped[1024];
+    json_escape((name && *name) ? *name : "", escaped, sizeof(escaped));
+    send_json(
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"func_get_name\",\"kernel_name\":\"%s\",\"payload\":{\"ret\":%d,\"name\":\"%s\",\"func\":\"%p\"}}",
+        now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
+        ret, escaped, hfunc);
+    return ret;
+}
+
 static CUresult handle_launch(CUfunction f,
                               unsigned int gridDimX,
                               unsigned int gridDimY,
@@ -1073,33 +1154,140 @@ CUresult cuLaunchKernel(CUfunction f,
                          real_cuLaunchKernel);
 }
 
+CUresult cuLaunchKernel_ptsz(CUfunction f,
+                             unsigned int gridDimX,
+                             unsigned int gridDimY,
+                             unsigned int gridDimZ,
+                             unsigned int blockDimX,
+                             unsigned int blockDimY,
+                             unsigned int blockDimZ,
+                             unsigned int sharedMemBytes,
+                             CUstream hStream,
+                             void** kernelParams,
+                             void** extra) {
+    init_once();
+    refresh_driver_symbols();
+    cuLaunchKernel_t launcher = real_cuLaunchKernel_ptsz ? real_cuLaunchKernel_ptsz : real_cuLaunchKernel;
+    if (!launcher) {
+        return 1;
+    }
+    return handle_launch(f, gridDimX, gridDimY, gridDimZ,
+                         blockDimX, blockDimY, blockDimZ,
+                         sharedMemBytes, hStream, kernelParams, extra,
+                         launcher);
+}
+
+static CUresult handle_launch_ex(const CUlaunchConfig* config,
+                                 CUfunction f,
+                                 void** kernelParams,
+                                 void** extra,
+                                 cuLaunchKernelEx_t launcher,
+                                 const char* api_name) {
+    if (!config || !launcher) {
+        return 1;
+    }
+
+    char* name = code_name_for(f);
+    launch_disassembler(f, name);
+
+    unsigned long long block_size =
+        (unsigned long long)config->blockDimX * (unsigned long long)config->blockDimY *
+        (unsigned long long)config->blockDimZ;
+    unsigned long long grid_size =
+        (unsigned long long)config->gridDimX * (unsigned long long)config->gridDimY *
+        (unsigned long long)config->gridDimZ;
+    unsigned long long warps_per_block = (block_size + WARP_SIZE - 1ULL) / WARP_SIZE;
+    unsigned long long total_warps = warps_per_block * grid_size;
+
+    CUevent start_event = NULL;
+    CUevent end_event = NULL;
+    struct stream_anchor* anchor = NULL;
+    int use_events = cuda_events_ready() &&
+                     real_cuEventCreate(&start_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
+                     real_cuEventCreate(&end_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
+                     real_cuEventRecord(start_event, config->hStream) == CU_SUCCESS;
+    if (use_events) {
+        anchor = get_stream_anchor(config->hStream);
+    }
+
+    long long cpu_start = now_ns();
+    CUresult ret = launcher(config, f, kernelParams, extra);
+    long long cpu_end = now_ns();
+
+    if (use_events && real_cuEventRecord(end_event, config->hStream) == CU_SUCCESS) {
+        struct launch_item* item = (struct launch_item*)calloc(1, sizeof(*item));
+        item->launch_id = __sync_add_and_fetch(&g_launch_seq, 1);
+        item->ret = ret;
+        item->kernel_name = name;
+        item->func = f;
+        item->stream = config->hStream;
+        item->start_event = start_event;
+        item->end_event = end_event;
+        item->anchor = anchor;
+        item->grid[0] = config->gridDimX;
+        item->grid[1] = config->gridDimY;
+        item->grid[2] = config->gridDimZ;
+        item->block[0] = config->blockDimX;
+        item->block[1] = config->blockDimY;
+        item->block[2] = config->blockDimZ;
+        item->shared_mem = config->sharedMemBytes;
+        item->warps_per_block = warps_per_block;
+        item->total_warps = total_warps;
+        item->cpu_enqueue_start_ns = cpu_start;
+        item->cpu_enqueue_end_ns = cpu_end;
+        queue_launch_item(item);
+    } else {
+        struct launch_item item;
+        memset(&item, 0, sizeof(item));
+        item.launch_id = __sync_add_and_fetch(&g_launch_seq, 1);
+        item.ret = ret;
+        item.kernel_name = name;
+        item.func = f;
+        item.stream = config->hStream;
+        item.grid[0] = config->gridDimX;
+        item.grid[1] = config->gridDimY;
+        item.grid[2] = config->gridDimZ;
+        item.block[0] = config->blockDimX;
+        item.block[1] = config->blockDimY;
+        item.block[2] = config->blockDimZ;
+        item.shared_mem = config->sharedMemBytes;
+        item.warps_per_block = warps_per_block;
+        item.total_warps = total_warps;
+        item.cpu_enqueue_start_ns = cpu_start;
+        item.cpu_enqueue_end_ns = cpu_end;
+        emit_kernel_launch(&item, cpu_end, cpu_end - cpu_start, cpu_start, cpu_end, api_name);
+        if (real_cuEventDestroy) {
+            if (start_event) {
+                real_cuEventDestroy(start_event);
+            }
+            if (end_event) {
+                real_cuEventDestroy(end_event);
+            }
+        }
+        free(name);
+    }
+    return ret;
+}
+
 CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
     init_once();
     refresh_driver_symbols();
-    if (!real_cuLaunchKernelEx || !config) {
+    if (!real_cuLaunchKernelEx) {
         return 1;
     }
-    char* name = code_name_for(f);
-    launch_disassembler(f, name);
-    free(name);
+    return handle_launch_ex(config, f, kernelParams, extra,
+                            real_cuLaunchKernelEx, "cuLaunchKernelEx_cpu_enqueue_fallback");
+}
 
-    // The Ex API is timed with CPU enqueue metadata only. The driver eventually
-    // dispatches through lower launch paths on most frameworks, so regular
-    // cuLaunchKernel events still cover common CUDA kernels.
-    long long start = now_ns();
-    CUresult ret = real_cuLaunchKernelEx(config, f, kernelParams, extra);
-    long long end = now_ns();
-    unsigned long long block_size =
-        (unsigned long long)config->blockDimX * config->blockDimY * config->blockDimZ;
-    unsigned long long grid_size =
-        (unsigned long long)config->gridDimX * config->gridDimY * config->gridDimZ;
-    unsigned long long warps = ((block_size + WARP_SIZE - 1ULL) / WARP_SIZE) * grid_size;
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_launch_ex\",\"source\":\"weaver_hook\",\"kernel_name\":\"<cuLaunchKernelEx>\",\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"dur_ns\":%lld,\"payload\":{\"ret\":%d,\"func\":\"%p\",\"stream\":\"%p\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared_mem\":%u,\"total_warps\":%llu,\"warp_scope\":\"block_runtime\",\"cuda_event_timing\":false}}",
-        start, getpid(), (unsigned long long)pthread_self(), start, end, end - start,
-        ret, f, config->hStream, config->gridDimX, config->gridDimY, config->gridDimZ,
-        config->blockDimX, config->blockDimY, config->blockDimZ, config->sharedMemBytes, warps);
-    return ret;
+CUresult cuLaunchKernelEx_ptsz(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
+    init_once();
+    refresh_driver_symbols();
+    cuLaunchKernelEx_t launcher = real_cuLaunchKernelEx_ptsz ? real_cuLaunchKernelEx_ptsz : real_cuLaunchKernelEx;
+    if (!launcher) {
+        return 1;
+    }
+    return handle_launch_ex(config, f, kernelParams, extra,
+                            launcher, "cuLaunchKernelEx_ptsz_cpu_enqueue_fallback");
 }
 
 static cudaError_t handle_runtime_launch(const void* func,
@@ -1205,6 +1393,23 @@ cudaError_t cudaLaunchKernel(const void* func,
                                  real_cudaLaunchKernel, "runtime_cpu_enqueue_fallback");
 }
 
+cudaError_t cudaLaunchKernel_ptsz(const void* func,
+                                  cuda_dim3 gridDim,
+                                  cuda_dim3 blockDim,
+                                  void** args,
+                                  size_t sharedMem,
+                                  cudaStream_t stream) {
+    init_once();
+    refresh_runtime_symbols();
+    cudaLaunchKernel_runtime_t launcher =
+        real_cudaLaunchKernel_ptsz ? real_cudaLaunchKernel_ptsz : real_cudaLaunchKernel;
+    if (!launcher) {
+        return 1;
+    }
+    return handle_runtime_launch(func, gridDim, blockDim, args, sharedMem, stream,
+                                 launcher, "runtime_ptsz_cpu_enqueue_fallback");
+}
+
 cudaError_t cudaLaunchCooperativeKernel(const void* func,
                                         cuda_dim3 gridDim,
                                         cuda_dim3 blockDim,
@@ -1221,32 +1426,229 @@ cudaError_t cudaLaunchCooperativeKernel(const void* func,
                                  "runtime_cooperative_cpu_enqueue_fallback");
 }
 
+cudaError_t cudaLaunchCooperativeKernel_ptsz(const void* func,
+                                             cuda_dim3 gridDim,
+                                             cuda_dim3 blockDim,
+                                             void** args,
+                                             size_t sharedMem,
+                                             cudaStream_t stream) {
+    init_once();
+    refresh_runtime_symbols();
+    cudaLaunchCooperativeKernel_t launcher =
+        real_cudaLaunchCooperativeKernel_ptsz ?
+        real_cudaLaunchCooperativeKernel_ptsz : real_cudaLaunchCooperativeKernel;
+    if (!launcher) {
+        return 1;
+    }
+    return handle_runtime_launch(func, gridDim, blockDim, args, sharedMem, stream,
+                                 launcher,
+                                 "runtime_cooperative_ptsz_cpu_enqueue_fallback");
+}
+
+static cudaError_t handle_runtime_launch_ex(const cudaLaunchConfig_runtime* config,
+                                            const void* func,
+                                            void** args,
+                                            cudaLaunchKernelExC_t launcher,
+                                            const char* api_name) {
+    if (!config || !launcher) {
+        return 1;
+    }
+
+    char* name = runtime_name_for(func);
+    launch_disassembler((CUfunction)func, name);
+
+    unsigned long long block_size =
+        (unsigned long long)config->blockDim.x * (unsigned long long)config->blockDim.y *
+        (unsigned long long)config->blockDim.z;
+    unsigned long long grid_size =
+        (unsigned long long)config->gridDim.x * (unsigned long long)config->gridDim.y *
+        (unsigned long long)config->gridDim.z;
+    unsigned long long warps_per_block = (block_size + WARP_SIZE - 1ULL) / WARP_SIZE;
+    unsigned long long total_warps = warps_per_block * grid_size;
+
+    CUevent start_event = NULL;
+    CUevent end_event = NULL;
+    struct stream_anchor* anchor = NULL;
+    int use_events = cuda_events_ready() &&
+                     real_cuEventCreate(&start_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
+                     real_cuEventCreate(&end_event, CU_EVENT_DEFAULT) == CU_SUCCESS &&
+                     real_cuEventRecord(start_event, (CUstream)config->stream) == CU_SUCCESS;
+    if (use_events) {
+        anchor = get_stream_anchor((CUstream)config->stream);
+    }
+
+    long long cpu_start = now_ns();
+    cudaError_t ret = launcher(config, func, args);
+    long long cpu_end = now_ns();
+
+    if (use_events && real_cuEventRecord(end_event, (CUstream)config->stream) == CU_SUCCESS) {
+        struct launch_item* item = (struct launch_item*)calloc(1, sizeof(*item));
+        item->launch_id = __sync_add_and_fetch(&g_launch_seq, 1);
+        item->ret = ret;
+        item->kernel_name = name;
+        item->func = (CUfunction)func;
+        item->stream = (CUstream)config->stream;
+        item->start_event = start_event;
+        item->end_event = end_event;
+        item->anchor = anchor;
+        item->grid[0] = config->gridDim.x;
+        item->grid[1] = config->gridDim.y;
+        item->grid[2] = config->gridDim.z;
+        item->block[0] = config->blockDim.x;
+        item->block[1] = config->blockDim.y;
+        item->block[2] = config->blockDim.z;
+        item->shared_mem = (unsigned int)config->dynamicSmemBytes;
+        item->warps_per_block = warps_per_block;
+        item->total_warps = total_warps;
+        item->cpu_enqueue_start_ns = cpu_start;
+        item->cpu_enqueue_end_ns = cpu_end;
+        queue_launch_item(item);
+    } else {
+        struct launch_item item;
+        memset(&item, 0, sizeof(item));
+        item.launch_id = __sync_add_and_fetch(&g_launch_seq, 1);
+        item.ret = ret;
+        item.kernel_name = name;
+        item.func = (CUfunction)func;
+        item.stream = (CUstream)config->stream;
+        item.grid[0] = config->gridDim.x;
+        item.grid[1] = config->gridDim.y;
+        item.grid[2] = config->gridDim.z;
+        item.block[0] = config->blockDim.x;
+        item.block[1] = config->blockDim.y;
+        item.block[2] = config->blockDim.z;
+        item.shared_mem = (unsigned int)config->dynamicSmemBytes;
+        item.warps_per_block = warps_per_block;
+        item.total_warps = total_warps;
+        item.cpu_enqueue_start_ns = cpu_start;
+        item.cpu_enqueue_end_ns = cpu_end;
+        emit_kernel_launch(&item, cpu_end, cpu_end - cpu_start, cpu_start, cpu_end, api_name);
+        if (real_cuEventDestroy) {
+            if (start_event) {
+                real_cuEventDestroy(start_event);
+            }
+            if (end_event) {
+                real_cuEventDestroy(end_event);
+            }
+        }
+        free(name);
+    }
+    return ret;
+}
+
 cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_runtime* config,
                                 const void* func,
                                 void** args) {
     init_once();
     refresh_runtime_symbols();
-    if (!real_cudaLaunchKernelExC || !config) {
+    if (!real_cudaLaunchKernelExC) {
         return 1;
     }
-    char* name = runtime_name_for(func);
-    launch_disassembler((CUfunction)func, name);
-    free(name);
+    return handle_runtime_launch_ex(config, func, args,
+                                    real_cudaLaunchKernelExC,
+                                    "runtime_ex_cpu_enqueue_fallback");
+}
 
-    long long start = now_ns();
-    cudaError_t ret = real_cudaLaunchKernelExC(config, func, args);
-    long long end = now_ns();
-    unsigned long long block_size =
-        (unsigned long long)config->blockDim.x * config->blockDim.y * config->blockDim.z;
-    unsigned long long grid_size =
-        (unsigned long long)config->gridDim.x * config->gridDim.y * config->gridDim.z;
-    unsigned long long warps = ((block_size + WARP_SIZE - 1ULL) / WARP_SIZE) * grid_size;
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_launch_ex\",\"source\":\"weaver_hook_runtime\",\"kernel_name\":\"<cudaLaunchKernelExC>\",\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"dur_ns\":%lld,\"payload\":{\"ret\":%d,\"func\":\"%p\",\"stream\":\"%p\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared_mem\":%zu,\"total_warps\":%llu,\"warp_scope\":\"block_runtime\",\"cuda_event_timing\":false}}",
-        start, getpid(), (unsigned long long)pthread_self(), start, end, end - start,
-        ret, func, config->stream, config->gridDim.x, config->gridDim.y, config->gridDim.z,
-        config->blockDim.x, config->blockDim.y, config->blockDim.z,
-        config->dynamicSmemBytes, warps);
+cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_runtime* config,
+                                     const void* func,
+                                     void** args) {
+    init_once();
+    refresh_runtime_symbols();
+    cudaLaunchKernelExC_t launcher =
+        real_cudaLaunchKernelExC_ptsz ? real_cudaLaunchKernelExC_ptsz : real_cudaLaunchKernelExC;
+    if (!launcher) {
+        return 1;
+    }
+    return handle_runtime_launch_ex(config, func, args,
+                                    launcher,
+                                    "runtime_ex_ptsz_cpu_enqueue_fallback");
+}
+
+static void patch_driver_proc_address(const char* symbol, void** pfn) {
+    if (!symbol || !pfn || !*pfn) {
+        return;
+    }
+    if (strcmp(symbol, "cuModuleLoadData") == 0) {
+        if (!real_cuModuleLoadData) {
+            real_cuModuleLoadData = (cuModuleLoadData_t)(*pfn);
+        }
+        *pfn = (void*)cuModuleLoadData;
+    } else if (strcmp(symbol, "cuModuleLoadDataEx") == 0) {
+        if (!real_cuModuleLoadDataEx) {
+            real_cuModuleLoadDataEx = (cuModuleLoadDataEx_t)(*pfn);
+        }
+        *pfn = (void*)cuModuleLoadDataEx;
+    } else if (strcmp(symbol, "cuModuleLoadFatBinary") == 0) {
+        if (!real_cuModuleLoadFatBinary) {
+            real_cuModuleLoadFatBinary = (cuModuleLoadFatBinary_t)(*pfn);
+        }
+        *pfn = (void*)cuModuleLoadFatBinary;
+    } else if (strcmp(symbol, "cuModuleGetFunction") == 0) {
+        if (!real_cuModuleGetFunction) {
+            real_cuModuleGetFunction = (cuModuleGetFunction_t)(*pfn);
+        }
+        *pfn = (void*)cuModuleGetFunction;
+    } else if (strcmp(symbol, "cuKernelGetFunction") == 0) {
+        if (!real_cuKernelGetFunction) {
+            real_cuKernelGetFunction = (cuKernelGetFunction_t)(*pfn);
+        }
+        *pfn = (void*)cuKernelGetFunction;
+    } else if (strcmp(symbol, "cuLibraryLoadData") == 0) {
+        if (!real_cuLibraryLoadData) {
+            real_cuLibraryLoadData = (cuLibraryLoadData_t)(*pfn);
+        }
+        *pfn = (void*)cuLibraryLoadData;
+    } else if (strcmp(symbol, "cuLibraryGetKernel") == 0) {
+        if (!real_cuLibraryGetKernel) {
+            real_cuLibraryGetKernel = (cuLibraryGetKernel_t)(*pfn);
+        }
+        *pfn = (void*)cuLibraryGetKernel;
+    } else if (strcmp(symbol, "cuLibraryGetModule") == 0) {
+        if (!real_cuLibraryGetModule) {
+            real_cuLibraryGetModule = (cuLibraryGetModule_t)(*pfn);
+        }
+        *pfn = (void*)cuLibraryGetModule;
+    } else if (strcmp(symbol, "cuFuncGetName") == 0) {
+        if (!real_cuFuncGetName) {
+            real_cuFuncGetName = (cuFuncGetName_t)(*pfn);
+        }
+        *pfn = (void*)cuFuncGetName;
+    } else if (strcmp(symbol, "cuLaunchKernel") == 0) {
+        if (!real_cuLaunchKernel) {
+            real_cuLaunchKernel = (cuLaunchKernel_t)(*pfn);
+        }
+        *pfn = (void*)cuLaunchKernel;
+    } else if (strcmp(symbol, "cuLaunchKernel_ptsz") == 0) {
+        if (!real_cuLaunchKernel_ptsz) {
+            real_cuLaunchKernel_ptsz = (cuLaunchKernel_t)(*pfn);
+        }
+        *pfn = (void*)cuLaunchKernel_ptsz;
+    } else if (strcmp(symbol, "cuLaunchKernelEx") == 0) {
+        if (!real_cuLaunchKernelEx) {
+            real_cuLaunchKernelEx = (cuLaunchKernelEx_t)(*pfn);
+        }
+        *pfn = (void*)cuLaunchKernelEx;
+    } else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) {
+        if (!real_cuLaunchKernelEx_ptsz) {
+            real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)(*pfn);
+        }
+        *pfn = (void*)cuLaunchKernelEx_ptsz;
+    }
+}
+
+static CUresult call_real_cu_get_proc_address(cuGetProcAddress_t getter,
+                                              const char* symbol,
+                                              void** pfn,
+                                              int cudaVersion,
+                                              uint64_t flags,
+                                              void* symbolStatus) {
+    if (!getter) {
+        return 1;
+    }
+    CUresult ret = getter(symbol, pfn, cudaVersion, flags, symbolStatus);
+    if (ret == CU_SUCCESS) {
+        patch_driver_proc_address(symbol, pfn);
+    }
     return ret;
 }
 
@@ -1257,24 +1659,19 @@ CUresult cuGetProcAddress(const char* symbol,
                           void* symbolStatus) {
     init_once();
     refresh_driver_symbols();
-    if (!real_cuGetProcAddress) {
-        return 1;
-    }
-    CUresult ret = real_cuGetProcAddress(symbol, pfn, cudaVersion, flags, symbolStatus);
-    if (ret == CU_SUCCESS && pfn && symbol) {
-        if (strcmp(symbol, "cuLaunchKernel") == 0) {
-            if (!real_cuLaunchKernel && *pfn) {
-                real_cuLaunchKernel = (cuLaunchKernel_t)(*pfn);
-            }
-            *pfn = (void*)cuLaunchKernel;
-        } else if (strcmp(symbol, "cuLaunchKernelEx") == 0) {
-            if (!real_cuLaunchKernelEx && *pfn) {
-                real_cuLaunchKernelEx = (cuLaunchKernelEx_t)(*pfn);
-            }
-            *pfn = (void*)cuLaunchKernelEx;
-        }
-    }
-    return ret;
+    cuGetProcAddress_t getter = real_cuGetProcAddress ? real_cuGetProcAddress : real_cuGetProcAddress_v2;
+    return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus);
+}
+
+CUresult cuGetProcAddress_v2(const char* symbol,
+                             void** pfn,
+                             int cudaVersion,
+                             uint64_t flags,
+                             void* symbolStatus) {
+    init_once();
+    refresh_driver_symbols();
+    cuGetProcAddress_t getter = real_cuGetProcAddress_v2 ? real_cuGetProcAddress_v2 : real_cuGetProcAddress;
+    return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus);
 }
 
 static void send_nccl_event(const char* kind, size_t count, int ret,

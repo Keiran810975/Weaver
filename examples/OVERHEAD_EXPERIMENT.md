@@ -23,6 +23,12 @@ overhead_pct = (median_step_ms(mode) - median_step_ms(baseline)) / median_step_m
 
 GPU Event step time, p95 step time, event count, and emitted event bytes are secondary metrics. Warmup iterations are excluded so one-time kernel capture/disassembly is amortized, which matches the intended online usage.
 
+By default the Weaver Python layer samples every 10 matched operator calls
+(`--python-sample-rate 10`) and disables GC events for this benchmark. Use
+`--python-sample-rate 1` when you want a full Python operator trace; that mode is
+expected to cost more because CPython invokes the profile callback on every
+Python call/return.
+
 ## Workload
 
 The quick preset is sized for a 2xV100 node and is intended to finish in about
@@ -65,6 +71,16 @@ dim = 512
 hidden_dim = 2048
 layers = 3
 explicit_comm_mb = 16
+python_sample_rate = 10
+```
+
+For an ablation that separates Python collection from the CUDA/NCCL hook:
+
+```bash
+PYTHONPATH=. python examples/run_overhead_experiment.py \
+  --preset quick \
+  --modes baseline,weaver_kernel_only,weaver_py_only,weaver_full \
+  --output-dir ./overhead_v100_ablation
 ```
 
 `torch_profiler` is intentionally not included in the default quick preset

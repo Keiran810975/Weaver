@@ -47,9 +47,12 @@ class PythonRuntimeCollector:
         self.cfg = config or PythonCollectorConfig()
         self.sender = _Sender(self.cfg.socket_path)
         self._count = 0
+        self._sample_rate = max(1, int(self.cfg.sample_rate))
+        self._targets = tuple(t.strip().replace("@", ".") for t in self.cfg.targets if t.strip())
         self._enabled = False
         self._orig_profiler = None
         self._active: Dict[int, Tuple[int, str]] = {}
+        self._match_cache: Dict[object, bool] = {}
         self._gc_callback = None
 
     def _is_interesting(self, filename: str) -> bool:
@@ -70,26 +73,32 @@ class PythonRuntimeCollector:
         return f"{module}.{qualname}"
 
     def _matches_target(self, frame: FrameType) -> bool:
-        if not self.cfg.targets:
-            return self._is_interesting(frame.f_code.co_filename)
+        code = frame.f_code
+        cached = self._match_cache.get(code)
+        if cached is not None:
+            return cached
+
+        if not self._targets:
+            matched = self._is_interesting(code.co_filename)
+            self._match_cache[code] = matched
+            return matched
 
         full = self._frame_name(frame)
         module = frame.f_globals.get("__name__", "")
-        func = frame.f_code.co_name
-        for target in self.cfg.targets:
-            target = target.strip()
-            if not target:
-                continue
-            normalized = target.replace("@", ".")
+        func = code.co_name
+        matched = False
+        for target in self._targets:
             if (
-                full == normalized
-                or full.endswith("." + normalized)
-                or module == normalized
-                or module.endswith("." + normalized)
-                or func == normalized
+                full == target
+                or full.endswith("." + target)
+                or module == target
+                or module.endswith("." + target)
+                or func == target
             ):
-                return True
-        return False
+                matched = True
+                break
+        self._match_cache[code] = matched
+        return matched
 
     def _build_event(self, kind: str, frame: FrameType) -> dict:
         code = frame.f_code
@@ -144,13 +153,12 @@ class PythonRuntimeCollector:
         if not self._matches_target(frame):
             return self._hook
 
-        self._count += 1
-        if self._count % max(1, self.cfg.sample_rate) != 0:
-            return self._hook
-
         fid = id(frame)
         now = time.time_ns()
         if event == "call":
+            self._count += 1
+            if self._count % self._sample_rate != 0:
+                return self._hook
             self._active[fid] = (now, self._frame_name(frame))
             if self.cfg.emit_raw_calls:
                 self.sender.send(self._build_event(event, frame))
