@@ -66,6 +66,8 @@ python your_training.py
 The hook emits online events for:
 - `cuModuleGetFunction` (kernel symbol mapping)
 - `cuLaunchKernel` (CUDA Event GPU duration + grid/block/shared mem + warp/block counts)
+- `cudaLaunchKernel`, `cudaLaunchKernelExC`, and `cudaLaunchCooperativeKernel` for CUDA Runtime API launches
+- `cuGetProcAddress` so libraries that resolve `cuLaunchKernel` dynamically still route through the hook
 - module/library binary captures and Neutrino-style disassembly summaries
 - NCCL collectives (`ncclAllReduce`, `ncclAllGather`, `ncclReduceScatter`, `ncclBroadcast`)
 
