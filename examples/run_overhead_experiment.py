@@ -15,25 +15,77 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD = ROOT / "examples" / "overhead_workload.py"
 HOOK = ROOT / "hooks" / "libweaver_hook.so"
 
+PRESETS = {
+    "quick": {
+        "output_dir": "./overhead_v100_quick",
+        "modes": "baseline,weaver_no_disasm,weaver_full",
+        "repeats": 1,
+        "nproc_per_node": 2,
+        "warmup": 5,
+        "iters": 20,
+        "batch_size": 4,
+        "seq_len": 256,
+        "dim": 512,
+        "hidden_dim": 2048,
+        "layers": 3,
+        "explicit_comm_mb": 16,
+        "profiler_active": 5,
+    },
+    "paper": {
+        "output_dir": "./overhead_out",
+        "modes": "baseline,weaver_full,weaver_no_disasm,torch_profiler",
+        "repeats": 3,
+        "nproc_per_node": 2,
+        "warmup": 20,
+        "iters": 100,
+        "batch_size": 8,
+        "seq_len": 512,
+        "dim": 1024,
+        "hidden_dim": 4096,
+        "layers": 6,
+        "explicit_comm_mb": 64,
+        "profiler_active": 10,
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Weaver overhead experiment modes")
-    parser.add_argument("--output-dir", default="./overhead_out")
-    parser.add_argument("--modes", default="baseline,weaver_full,torch_profiler")
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--nproc-per-node", type=int, default=2)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=512)
-    parser.add_argument("--dim", type=int, default=1024)
-    parser.add_argument("--hidden-dim", type=int, default=4096)
-    parser.add_argument("--layers", type=int, default=6)
-    parser.add_argument("--explicit-comm-mb", type=int, default=64)
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESETS),
+        default="quick",
+        help="quick is sized for a 2xV100 smoke/overhead run; paper restores the longer experiment",
+    )
+    parser.add_argument("--output-dir")
+    parser.add_argument("--modes")
+    parser.add_argument("--repeats", type=int)
+    parser.add_argument("--nproc-per-node", type=int)
+    parser.add_argument("--warmup", type=int)
+    parser.add_argument("--iters", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--seq-len", type=int)
+    parser.add_argument("--dim", type=int)
+    parser.add_argument("--hidden-dim", type=int)
+    parser.add_argument("--layers", type=int)
+    parser.add_argument("--explicit-comm-mb", type=int)
     parser.add_argument("--base-http-port", type=int, default=18770)
+    parser.add_argument("--profiler-active", type=int)
+    parser.add_argument("--profiler-record-shapes", action="store_true")
+    parser.add_argument("--profiler-profile-memory", action="store_true")
+    parser.add_argument("--profiler-with-stack", action="store_true")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--skip-hook-build", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    apply_preset_defaults(args)
+    return args
+
+
+def apply_preset_defaults(args: argparse.Namespace) -> None:
+    preset = PRESETS[args.preset]
+    for key, value in preset.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
 
 
 def percentile(values: List[float], pct: float) -> float:
@@ -191,7 +243,21 @@ def workload_cmd(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -
     ]
     if mode == "torch_profiler":
         cmd.append("--torch-profiler")
+        cmd.extend(["--profiler-active", str(args.profiler_active)])
+        if args.profiler_record_shapes:
+            cmd.append("--profiler-record-shapes")
+        if args.profiler_profile_memory:
+            cmd.append("--profiler-profile-memory")
+        if args.profiler_with_stack:
+            cmd.append("--profiler-with-stack")
     return cmd
+
+
+def read_log_tail(path: Path, max_lines: int = 80) -> str:
+    if not path.exists():
+        return ""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-max_lines:])
 
 
 def count_weaver_events(path: Path) -> Dict[str, object]:
@@ -249,7 +315,11 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
         with (run_dir / "run_result.json").open("w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=True, indent=2)
         if proc.returncode != 0:
-            raise RuntimeError(f"{mode} rep {rep} failed; see {log_path}")
+            tail = read_log_tail(log_path)
+            detail = f"{mode} rep {rep} failed; see {log_path}"
+            if tail:
+                detail += f"\n--- torchrun.log tail ---\n{tail}"
+            raise RuntimeError(detail)
         return result
     finally:
         stop_daemon(daemon)
@@ -322,6 +392,7 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
     summary = {
         "experiment": "weaver_three_layer_collection_overhead",
         "method": {
+            "preset": args.preset,
             "baseline": "same dual-GPU workload without daemon, CPython profile hook, or LD_PRELOAD hook",
             "weaver_full": "daemon + CPython profile hook + LD_PRELOAD CUDA/NCCL hook + CUDA Event poller + disassembly sidecar",
             "steady_state": "warmup iterations are excluded; one-time binary capture/disassembly is expected to happen during warmup",

@@ -25,35 +25,66 @@ GPU Event step time, p95 step time, event count, and emitted event bytes are sec
 
 ## Workload
 
-The workload is intentionally more substantial than a single GEMM:
+The quick preset is sized for a 2xV100 node and is intended to finish in about
+five minutes or less. It is still more substantial than a single GEMM:
 
 - Transformer-like MLP blocks with LayerNorm, GELU/SILU, and large Linear kernels.
 - DistributedDataParallel gradient synchronization.
-- An explicit 64 MB NCCL `all_reduce` every step.
+- An explicit 16 MB NCCL `all_reduce` every step in the quick preset.
 - AdamW optimizer step.
 
 This gives enough Python operator activity, compute kernels, and communication kernels to exercise the three layers.
 
-## Run On A Dual-GPU Node
+## Quick Run On A 2xV100 Node
 
 From the repository root:
 
 ```bash
 PYTHONPATH=. python examples/run_overhead_experiment.py \
-  --modes baseline,weaver_full,weaver_no_disasm,torch_profiler \
-  --repeats 3 \
-  --nproc-per-node 2 \
-  --warmup 20 \
-  --iters 100 \
-  --output-dir ./overhead_out
+  --preset quick \
+  --output-dir ./overhead_v100_quick
 ```
 
 Outputs:
 
-- `overhead_out/summary.json`: machine-readable summary.
-- `overhead_out/summary.md`: compact report table.
-- `overhead_out/<mode>/rep_<n>/rank_<r>/step_metrics.jsonl`: raw per-step records.
-- `overhead_out/<mode>/rep_<n>/weaver_events.ndjson`: Weaver daemon events for Weaver modes.
+- `overhead_v100_quick/summary.json`: machine-readable summary.
+- `overhead_v100_quick/summary.md`: compact report table.
+- `overhead_v100_quick/<mode>/rep_<n>/rank_<r>/step_metrics.jsonl`: raw per-step records.
+- `overhead_v100_quick/<mode>/rep_<n>/weaver_events.ndjson`: Weaver daemon events for Weaver modes.
+
+The quick preset uses:
+
+```text
+modes = baseline,weaver_no_disasm,weaver_full
+repeats = 1
+warmup = 5
+iters = 20
+batch_size = 4
+seq_len = 256
+dim = 512
+hidden_dim = 2048
+layers = 3
+explicit_comm_mb = 16
+```
+
+`torch_profiler` is intentionally not included in the default quick preset
+because trace export time can be noisy. To include it as a reference while still
+keeping the run short:
+
+```bash
+PYTHONPATH=. python examples/run_overhead_experiment.py \
+  --preset quick \
+  --modes baseline,weaver_full,torch_profiler \
+  --output-dir ./overhead_v100_quick_profiler
+```
+
+For the longer paper-grade run:
+
+```bash
+PYTHONPATH=. python examples/run_overhead_experiment.py \
+  --preset paper \
+  --output-dir ./overhead_out
+```
 
 ## Interpreting Results
 

@@ -163,12 +163,11 @@ To validate low overhead, run the dual-GPU DDP benchmark:
 
 ```bash
 PYTHONPATH=. python examples/run_overhead_experiment.py \
-	--modes baseline,weaver_full,weaver_no_disasm,torch_profiler \
-	--repeats 3 --nproc-per-node 2 --warmup 20 --iters 100 \
-	--output-dir ./overhead_out
+	--preset quick \
+	--output-dir ./overhead_v100_quick
 ```
 
-It compares the same workload without collection, with Weaver's three-layer collection, with Weaver disassembly disabled, and with PyTorch profiler as a reference. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
+The quick preset is sized for a 2xV100 node and should finish in roughly five minutes or less. It compares the same workload without collection, with Weaver's three-layer collection, and with Weaver disassembly disabled. `torch_profiler` remains available as an optional reference mode. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
 
 ## Event schema (high-level)
 

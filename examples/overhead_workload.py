@@ -23,6 +23,7 @@ class StepMetric:
     world_size: int
     iteration: int
     measured: bool
+    profiled: bool
     host_step_ms: float
     gpu_step_ms: float
     forward_ms: float
@@ -70,20 +71,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-mode", default=os.environ.get("WEAVER_OVERHEAD_MODE", "baseline"))
     parser.add_argument("--repetition", type=int, default=int(os.environ.get("WEAVER_OVERHEAD_REP", "0")))
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seq-len", type=int, default=512)
-    parser.add_argument("--dim", type=int, default=1024)
-    parser.add_argument("--hidden-dim", type=int, default=4096)
-    parser.add_argument("--layers", type=int, default=6)
-    parser.add_argument("--explicit-comm-mb", type=int, default=64)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--seq-len", type=int, default=256)
+    parser.add_argument("--dim", type=int, default=512)
+    parser.add_argument("--hidden-dim", type=int, default=2048)
+    parser.add_argument("--layers", type=int, default=3)
+    parser.add_argument("--explicit-comm-mb", type=int, default=16)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--torch-profiler", action="store_true")
-    parser.add_argument("--profiler-wait", type=int, default=2)
+    parser.add_argument("--profiler-wait", type=int)
     parser.add_argument("--profiler-warmup", type=int, default=3)
+    parser.add_argument("--profiler-active", type=int, default=5)
+    parser.add_argument("--profiler-record-shapes", action="store_true")
+    parser.add_argument("--profiler-profile-memory", action="store_true")
+    parser.add_argument("--profiler-with-stack", action="store_true")
     return parser.parse_args()
+
+
+def normalize_profiler_args(args: argparse.Namespace) -> None:
+    if args.profiler_wait is None:
+        args.profiler_wait = max(0, args.warmup - max(0, args.profiler_warmup))
+
+
+def is_profiler_active_step(args: argparse.Namespace, iteration: int) -> bool:
+    if not args.torch_profiler:
+        return False
+    active_start = max(0, args.profiler_wait) + max(0, args.profiler_warmup)
+    active_end = active_start + max(1, args.profiler_active)
+    return active_start <= iteration < active_end
 
 
 def setup_dist() -> None:
@@ -231,12 +249,12 @@ def profiler_context(args: argparse.Namespace, output_dir: Path):
         schedule=torch.profiler.schedule(
             wait=max(0, args.profiler_wait),
             warmup=max(0, args.profiler_warmup),
-            active=max(1, args.iters),
+            active=max(1, args.profiler_active),
             repeat=1,
         ),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
+        record_shapes=args.profiler_record_shapes,
+        profile_memory=args.profiler_profile_memory,
+        with_stack=args.profiler_with_stack,
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
             str(output_dir / "torch_profiler" / f"rank_{rank()}")
         ),
@@ -245,6 +263,7 @@ def profiler_context(args: argparse.Namespace, output_dir: Path):
 
 def main() -> None:
     args = parse_args()
+    normalize_profiler_args(args)
     setup_dist()
 
     r = rank()
@@ -283,6 +302,10 @@ def main() -> None:
             "explicit_comm_mb": args.explicit_comm_mb,
             "warmup": args.warmup,
             "iters": args.iters,
+            "profiler_active": args.profiler_active,
+            "profiler_record_shapes": args.profiler_record_shapes,
+            "profiler_profile_memory": args.profiler_profile_memory,
+            "profiler_with_stack": args.profiler_with_stack,
         },
         "env": {
             "WEAVER_AUTO_PROFILE": os.environ.get("WEAVER_AUTO_PROFILE", ""),
@@ -307,7 +330,10 @@ def main() -> None:
         context.__enter__()
     try:
         for i in range(total):
+            profiled = is_profiler_active_step(args, i)
             measured = i >= args.warmup
+            if args.torch_profiler:
+                measured = measured and profiled
             torch.cuda.synchronize()
             step_start = torch.cuda.Event(enable_timing=True)
             step_end = torch.cuda.Event(enable_timing=True)
@@ -326,6 +352,7 @@ def main() -> None:
                 world_size=ws,
                 iteration=i,
                 measured=measured,
+                profiled=profiled,
                 host_step_ms=(host_end - host_start) / 1e6,
                 gpu_step_ms=event_elapsed(step_start, step_end),
                 forward_ms=float(parts["forward_ms"]),
