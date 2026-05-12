@@ -104,3 +104,34 @@ def test_normalizer_reads_profile_operator_payload(tmp_path):
     assert operators[0].operator_name == "torch.cuda.synchronize"
     assert operators[0].duration_ns == 20
     assert syncs == []
+
+
+def test_normalizer_uses_gemm_flops_when_shape_payload_available(tmp_path):
+    timeline = tmp_path / "timeline.ndjson"
+    _write_events(
+        timeline,
+        [
+            {
+                "ts_ns": 1000,
+                "pid": 1,
+                "layer": "cuda",
+                "kind": "kernel_launch",
+                "kernel_name": "cutlass_kernel_gemm",
+                "gpu_start_ns": 1000,
+                "gpu_end_ns": 2000,
+                "payload": {
+                    "M": 2,
+                    "N": 3,
+                    "K": 4,
+                    "batch": 5,
+                    "grid": [1, 1, 1],
+                    "block": [32, 1, 1],
+                },
+            }
+        ],
+    )
+
+    kernels, _, _ = TimelineNormalizer(str(timeline)).normalize()
+
+    assert kernels[0].work_type == "flops"
+    assert kernels[0].work_value == 2 * 2 * 3 * 4 * 5

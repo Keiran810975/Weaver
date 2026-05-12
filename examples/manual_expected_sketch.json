@@ -1,0 +1,41 @@
+{
+  "metadata": {
+    "schema_version": "0.2",
+    "source": "manual",
+    "workload": "ddp_compute_comm_overlap",
+    "description": "Manual expected sketch for module-3 differential diagnosis."
+  },
+  "expected_dependencies": [
+    {
+      "dependency_id": "gemm_before_nccl_allreduce",
+      "type": "hard",
+      "relation": "immediate_predecessor",
+      "target": {
+        "family": "NCCL",
+        "tag_regex": "NCCL_allreduce_.*"
+      },
+      "predecessors": [
+        {
+          "family": "GEMM"
+        }
+      ],
+      "description": "In the expected backward overlap region, the NCCL all-reduce should follow the compute kernel directly; an extra memcpy/cast/layout kernel on the critical path is suspicious."
+    }
+  ],
+  "overlap_expectations": [
+    {
+      "relation_id": "backward_compute_grad_comm",
+      "left_family": "GEMM",
+      "right_family": "NCCL",
+      "phase": "backward",
+      "expected": "may_overlap"
+    },
+    {
+      "relation_id": "memcpy_compute",
+      "left_family": "MEMCPY",
+      "right_family": "GEMM",
+      "phase": null,
+      "expected": "may_overlap"
+    }
+  ]
+}

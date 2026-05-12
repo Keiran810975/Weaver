@@ -8,39 +8,53 @@
 """
 
 import statistics
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Optional
 from collections import defaultdict
 
-from .records import KernelRecord, Candidate
+from .records import KernelRecord, Candidate, SyncRecord
+from .sketch_match import (
+    dependency_uses_same_stream,
+    expected_dependencies_for_target,
+    find_matching_predecessors,
+    selector_matches_kernel,
+)
 from ..sketch import ExecutionSketch
+from ..sketch.rules import get_default_overlap_expectations
 
 
 class CandidateDiscovery:
     """候选 target 发现。"""
 
-    def __init__(self, sketch: ExecutionSketch):
+    def __init__(self,
+                 sketch: Optional[ExecutionSketch] = None,
+                 min_long_gap_ns: int = 1_000_000,
+                 adjacent_gap_ns: int = 100_000):
         """
         初始化候选发现。
         
         Args:
-            sketch: ExecutionSketch 对象
+            sketch: ExecutionSketch 对象。可选；没有 sketch 时使用同次运行差分和默认 overlap 关系。
         """
         self.sketch = sketch
-        self.unknown_families = set(t.family for t in sketch.kernel_templates if t.family == "UNKNOWN")
+        self.min_long_gap_ns = min_long_gap_ns
+        self.adjacent_gap_ns = adjacent_gap_ns
 
-    def discover(self, records: List[KernelRecord]) -> List[Candidate]:
+    def discover(self,
+                 records: List[KernelRecord],
+                 syncs: Optional[List[SyncRecord]] = None) -> List[Candidate]:
         """
         发现所有候选 target kernel。
         
         Args:
             records: 规范化的 kernel records
+            syncs: 规范化的同步记录，可选
             
         返回：候选列表
         """
         candidates = []
 
         # A. 结构偏离候选
-        candidates.extend(self._find_structural_deviation_candidates(records))
+        candidates.extend(self._find_structural_deviation_candidates(records, syncs or []))
 
         # B. 性能异常候选（基于 normalized progress）
         candidates.extend(self._find_progress_outlier_candidates(records))
@@ -48,9 +62,11 @@ class CandidateDiscovery:
         # C. Rank/bucket 异常候选
         candidates.extend(self._find_rank_outlier_candidates(records))
 
-        return candidates
+        return self._dedupe(candidates)
 
-    def _find_structural_deviation_candidates(self, records: List[KernelRecord]) -> List[Candidate]:
+    def _find_structural_deviation_candidates(self,
+                                              records: List[KernelRecord],
+                                              syncs: List[SyncRecord]) -> List[Candidate]:
         """发现结构偏离候选。"""
         candidates = []
 
@@ -70,9 +86,78 @@ class CandidateDiscovery:
 
         # A2. 意外的前驱 kernel
         candidates.extend(self._find_unexpected_predecessor_candidates(records))
+        candidates.extend(self._find_manual_dependency_deviation_candidates(records))
 
         # A3. 预期 overlap 丧失
         candidates.extend(self._find_overlap_loss_candidates(records))
+
+        # A4. sync/event wait 后紧接的 kernel。slide 里把 cuda synchronize / event wait
+        # 作为可能破坏 overlap 的 extra event，这里即使没有完整 sketch 也先拉进候选。
+        candidates.extend(self._find_sync_preceded_candidates(records, syncs))
+
+        return candidates
+
+    def _find_manual_dependency_deviation_candidates(self,
+                                                     records: List[KernelRecord]) -> List[Candidate]:
+        """用手工 expected_dependencies 对比 actual predecessor。"""
+        if self.sketch is None or not getattr(self.sketch, "expected_dependencies", None):
+            return []
+
+        candidates = []
+        by_stream = defaultdict(list)
+        for record in records:
+            by_stream[record.stream or "default"].append(record)
+
+        for stream, kernels in by_stream.items():
+            sorted_kernels = sorted(kernels, key=lambda k: k.gpu_start_ns or k.cpu_enqueue_start_ns or 0)
+            for i, target in enumerate(sorted_kernels):
+                deps = expected_dependencies_for_target(self.sketch, target)
+                if not deps:
+                    continue
+                actual_pred = sorted_kernels[i - 1] if i > 0 else None
+                if actual_pred is None:
+                    candidates.append(Candidate(
+                        target_id=target.kid,
+                        candidate_type="structural_deviation",
+                        reason="missing_expected_predecessor",
+                        evidence={
+                            "manual_dependency_ids": [dep.dependency_id for dep in deps],
+                            "target_family": target.family,
+                            "target_tag": target.tag,
+                        },
+                        confidence=0.75,
+                    ))
+                    continue
+
+                expected_found = []
+                actual_matches = False
+                for dep in deps:
+                    expected_preds = find_matching_predecessors(
+                        target,
+                        records,
+                        dep.predecessors,
+                        same_stream=dependency_uses_same_stream(dep),
+                    )
+                    expected_found.extend(expected_preds)
+                    if any(selector_matches_kernel(selector, actual_pred) for selector in dep.predecessors):
+                        actual_matches = True
+
+                if not actual_matches:
+                    candidates.append(Candidate(
+                        target_id=target.kid,
+                        candidate_type="structural_deviation",
+                        reason="unexpected_predecessor_against_manual_sketch",
+                        evidence={
+                            "actual_predecessor_id": actual_pred.kid,
+                            "actual_predecessor_kernel": actual_pred.kernel_name,
+                            "actual_predecessor_family": actual_pred.family,
+                            "manual_dependency_ids": [dep.dependency_id for dep in deps],
+                            "expected_predecessor_ids": [pred.kid for pred in expected_found],
+                            "target_family": target.family,
+                            "target_tag": target.tag,
+                        },
+                        confidence=0.85,
+                    ))
 
         return candidates
 
@@ -103,8 +188,11 @@ class CandidateDiscovery:
                 else:
                     gap = None
 
-                # 如果 gap 过大（> 1ms），可能有问题
-                if gap is not None and gap > 1_000_000:  # 1ms
+                if gap is None:
+                    continue
+
+                # 如果 gap 过大，可能存在 CPU/runtime/sync 阻塞。
+                if gap > self.min_long_gap_ns:
                     candidates.append(Candidate(
                         target_id=target.kid,
                         candidate_type="structural_deviation",
@@ -117,14 +205,36 @@ class CandidateDiscovery:
                         confidence=0.5,
                     ))
 
+                # 如果一个额外/轻量 kernel 紧贴 target，slide 15 中的
+                # A -> extra_kernel -> target 需要优先进入依赖定位。
+                if self._looks_extra(prev) and 0 <= gap <= self.adjacent_gap_ns:
+                    candidates.append(Candidate(
+                        target_id=target.kid,
+                        candidate_type="structural_deviation",
+                        reason="extra_predecessor",
+                        evidence={
+                            "predecessor_id": prev.kid,
+                            "predecessor_family": prev.family,
+                            "predecessor_kernel": prev.kernel_name,
+                            "gap_ns": gap,
+                        },
+                        confidence=0.65,
+                    ))
+
         return candidates
 
     def _find_overlap_loss_candidates(self, records: List[KernelRecord]) -> List[Candidate]:
         """找 overlap 丧失的候选。"""
         candidates = []
 
-        # 从 sketch 中获取 overlap expectations
-        for oe in self.sketch.overlap_expectations:
+        # 优先使用 sketch；没有 sketch 时使用模块三的默认可并行关系做同次运行差分。
+        overlap_expectations = (
+            self.sketch.overlap_expectations
+            if self.sketch is not None
+            else get_default_overlap_expectations()
+        )
+
+        for oe in overlap_expectations:
             if oe.expected.value != "may_overlap":
                 continue
 
@@ -156,6 +266,48 @@ class CandidateDiscovery:
                             confidence=0.6,
                         ))
                         break
+
+        return candidates
+
+    def _find_sync_preceded_candidates(self,
+                                       records: List[KernelRecord],
+                                       syncs: List[SyncRecord]) -> List[Candidate]:
+        """找同步事件后紧接启动的 kernel。"""
+        candidates = []
+        if not syncs:
+            return candidates
+
+        for sync in syncs:
+            sync_end = sync.ts_end_ns or sync.ts_start_ns
+            if sync_end is None:
+                continue
+            same_scope = [
+                k for k in records
+                if (sync.rank is None or k.rank == sync.rank) and k.pid == sync.pid
+            ]
+            following = []
+            for kernel in same_scope:
+                start = kernel.cpu_enqueue_start_ns or kernel.gpu_start_ns
+                if start is None or start < sync_end:
+                    continue
+                following.append((start - sync_end, kernel))
+            if not following:
+                continue
+            following.sort(key=lambda item: item[0])
+            gap, target = following[0]
+            if gap <= self.min_long_gap_ns:
+                candidates.append(Candidate(
+                    target_id=target.kid,
+                    candidate_type="structural_deviation",
+                    reason="sync_preceded_kernel",
+                    evidence={
+                        "sync_id": sync.sid,
+                        "sync_kind": sync.kind.value,
+                        "sync_duration_ns": sync.duration_ns,
+                        "gap_ns": gap,
+                    },
+                    confidence=0.7,
+                ))
 
         return candidates
 
@@ -251,6 +403,27 @@ class CandidateDiscovery:
                     ))
 
         return candidates
+
+    def _looks_extra(self, record: KernelRecord) -> bool:
+        """判断一个前驱是否像 slide 中的 extra kernel。"""
+        if record.family in {"UNKNOWN", "MEMCPY", "ELEMENTWISE"}:
+            return True
+        name = record.kernel_name.lower()
+        op = (record.operator_name or "").lower()
+        return any(
+            token in name or token in op
+            for token in ("copy", "cast", "contiguous", "layout", "memset", "fill", "zero")
+        )
+
+    def _dedupe(self, candidates: List[Candidate]) -> List[Candidate]:
+        """按 target/reason 合并候选，保留最高置信度和证据。"""
+        merged: Dict[tuple, Candidate] = {}
+        for candidate in candidates:
+            key = (candidate.target_id, candidate.candidate_type, candidate.reason)
+            old = merged.get(key)
+            if old is None or candidate.confidence > old.confidence:
+                merged[key] = candidate
+        return list(merged.values())
 
     def _compute_overlap(self, k1: KernelRecord, k2: KernelRecord) -> Optional[int]:
         """

@@ -24,6 +24,7 @@ from .timing import TimingAnalyzer
 from .dependency import DependencyLocalizer
 from .resource import ResourceLocalizer
 from .report import DiagnosisReporter
+from .records import SlowdownDiagnosis, SlowdownType
 
 
 def load_execution_sketch(sketch_path: str):
@@ -117,8 +118,8 @@ def main():
         if args.verbose:
             print("Step 3: 发现候选...", file=sys.stderr)
 
-        discoverer = CandidateDiscovery(sketch) if sketch else None
-        candidates = discoverer.discover(kernels) if discoverer else []
+        discoverer = CandidateDiscovery(sketch)
+        candidates = discoverer.discover(kernels, syncs)
 
         if args.verbose:
             print(f"  发现了 {len(candidates)} 个候选", file=sys.stderr)
@@ -127,8 +128,14 @@ def main():
         if args.verbose:
             print("Step 4: 分类性能下降类型...", file=sys.stderr)
 
+        candidate_ids = {c.target_id for c in candidates}
+        candidate_targets = [k for k in kernels if k.kid in candidate_ids]
+        if not candidate_targets and args.verbose:
+            print("  没有候选 target，跳过定位阶段", file=sys.stderr)
+
         analyzer = TimingAnalyzer()
-        slowdown_diagnoses = analyzer.classify_batch(kernels[:100], kernels)  # 限制处理数量
+        slowdown_diagnoses = analyzer.classify_batch(candidate_targets, kernels, syncs)
+        _promote_structural_dependency_candidates(candidates, slowdown_diagnoses)
 
         if args.verbose:
             print(f"  分类了 {len(slowdown_diagnoses)} 个 kernel", file=sys.stderr)
@@ -140,10 +147,10 @@ def main():
         dep_localizer = DependencyLocalizer()
         dependency_diagnoses = {}
         for kid, diag in slowdown_diagnoses.items():
-            if diag.slowdown_type.value == "dependency_blocked":
+            if diag.slowdown_type.value in ("cpu_runtime_blocked", "dependency_blocked"):
                 target = next((k for k in kernels if k.kid == kid), None)
                 if target:
-                    dep_diag = dep_localizer.localize(target, kernels, sketch)
+                    dep_diag = dep_localizer.localize(target, kernels, sketch, syncs)
                     if dep_diag:
                         dependency_diagnoses[kid] = dep_diag
 
@@ -219,6 +226,32 @@ def main():
             import traceback
             traceback.print_exc()
         return 1
+
+
+def _promote_structural_dependency_candidates(candidates, slowdown_diagnoses):
+    """Manual sketches can prove dependency blocking before timing outlier is visible."""
+    dependency_reasons = {
+        "unexpected_predecessor_against_manual_sketch",
+        "missing_expected_predecessor",
+        "extra_predecessor",
+        "sync_preceded_kernel",
+    }
+    for candidate in candidates:
+        if candidate.reason not in dependency_reasons:
+            continue
+        current = slowdown_diagnoses.get(candidate.target_id)
+        if current is not None and current.slowdown_type != SlowdownType.UNCERTAIN:
+            continue
+        slowdown_diagnoses[candidate.target_id] = SlowdownDiagnosis(
+            target_id=candidate.target_id,
+            slowdown_type=SlowdownType.DEPENDENCY_BLOCKED,
+            confidence=max(0.65, candidate.confidence),
+            evidence={
+                "decision": "manual_sketch_dependency_deviation",
+                "reason": candidate.reason,
+                "candidate_evidence": candidate.evidence,
+            },
+        )
 
 
 if __name__ == "__main__":

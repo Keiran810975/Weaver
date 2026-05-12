@@ -155,11 +155,70 @@ class OverlapRelation:
 
 
 @dataclass
+class ExpectedDependency:
+    """手工预期依赖：描述 target 应该被哪些前驱解释。"""
+    dependency_id: str
+    target: Dict[str, Any]
+    predecessors: List[Dict[str, Any]]
+    type: DependencyType = DependencyType.HARD
+    relation: str = "immediate_predecessor"
+    max_gap_ns: Optional[int] = None
+    description: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "dependency_id": self.dependency_id,
+            "target": self.target,
+            "predecessors": self.predecessors,
+            "type": self.type.value,
+            "relation": self.relation,
+            "max_gap_ns": self.max_gap_ns,
+            "description": self.description,
+        }
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "ExpectedDependency":
+        predecessors = d.get("predecessors")
+        if predecessors is None and "predecessor" in d:
+            predecessors = [d["predecessor"]]
+        if predecessors is None:
+            predecessors = []
+
+        target = d.get("target")
+        if target is None:
+            target = {
+                key.replace("target_", ""): value
+                for key, value in d.items()
+                if key.startswith("target_")
+            }
+
+        if not predecessors:
+            predecessor = {
+                key.replace("predecessor_", ""): value
+                for key, value in d.items()
+                if key.startswith("predecessor_")
+            }
+            if predecessor:
+                predecessors = [predecessor]
+
+        return ExpectedDependency(
+            dependency_id=d.get("dependency_id") or d.get("rule_id") or "manual_dependency",
+            target=target or {},
+            predecessors=predecessors,
+            type=DependencyType(d.get("type", "hard")),
+            relation=d.get("relation", "immediate_predecessor"),
+            max_gap_ns=d.get("max_gap_ns"),
+            description=d.get("description", ""),
+        )
+
+
+@dataclass
 class ExecutionSketch:
     """执行草图。轻量级结构，不存历史数据，只提供语义抽象。"""
     metadata: Dict[str, Any]
     kernel_templates: List[KernelTemplate] = field(default_factory=list)
     dependency_rules: List[DependencyRule] = field(default_factory=list)
+    expected_dependencies: List[ExpectedDependency] = field(default_factory=list)
     overlap_expectations: List[OverlapRelation] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -167,15 +226,20 @@ class ExecutionSketch:
             "metadata": self.metadata,
             "kernel_templates": [kt.to_dict() for kt in self.kernel_templates],
             "dependency_rules": [dr.to_dict() for dr in self.dependency_rules],
+            "expected_dependencies": [ed.to_dict() for ed in self.expected_dependencies],
             "overlap_expectations": [oe.to_dict() for oe in self.overlap_expectations],
         }
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "ExecutionSketch":
+        expected_dependencies = d.get("expected_dependencies")
+        if expected_dependencies is None:
+            expected_dependencies = d.get("dependency_expectations", [])
         return ExecutionSketch(
             metadata=d.get("metadata", {}),
             kernel_templates=[KernelTemplate.from_dict(kt) for kt in d.get("kernel_templates", [])],
             dependency_rules=[DependencyRule.from_dict(dr) for dr in d.get("dependency_rules", [])],
+            expected_dependencies=[ExpectedDependency.from_dict(ed) for ed in expected_dependencies],
             overlap_expectations=[OverlapRelation.from_dict(oe) for oe in d.get("overlap_expectations", [])],
         )
 

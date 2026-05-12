@@ -91,11 +91,12 @@ class KernelRecord:
 
     def progress(self) -> Optional[float]:
         """计算工作进度（工作量/耗时）。"""
-        if self.work_value is None or self.gpu_dur_ns is None:
-            if self.work_value is None or self.duration_ns is None:
-                return None
-            return self.work_value / self.duration_ns
-        return self.work_value / self.gpu_dur_ns
+        if self.work_value is None:
+            return None
+        duration = self.gpu_dur_ns if self.gpu_dur_ns is not None else self.duration_ns
+        if duration is None or duration <= 0:
+            return None
+        return self.work_value / duration
 
 
 @dataclass
@@ -147,6 +148,13 @@ class SyncRecord:
     def duration_ns(self) -> Optional[int]:
         if self.ts_end_ns is not None:
             return self.ts_end_ns - self.ts_start_ns
+        return None
+
+    @property
+    def interval(self) -> Optional[Tuple[int, int]]:
+        """返回同步事件区间。"""
+        if self.ts_end_ns is not None:
+            return (self.ts_start_ns, self.ts_end_ns)
         return None
 
 
@@ -233,6 +241,7 @@ class DependencyDiagnosis:
     target_id: str
     blocker_id: str
     delay_ns: int
+    blocker_kind: str = "kernel"  # kernel | sync | host
     overlap_loss_ns: Optional[int] = None
     counterfactual_start_ns: Optional[int] = None
     confidence: float = 0.5
@@ -243,6 +252,7 @@ class DependencyDiagnosis:
         return {
             "target_id": self.target_id,
             "blocker_id": self.blocker_id,
+            "blocker_kind": self.blocker_kind,
             "delay_ns": self.delay_ns,
             "overlap_loss_ns": self.overlap_loss_ns,
             "counterfactual_start_ns": self.counterfactual_start_ns,
@@ -261,6 +271,7 @@ class ResourceDiagnosis:
     overlap_ratio: float = 0.0
     dose_response_score: float = 0.0
     resource_hint: str = "unknown"
+    warp_block_verdict: str = "not_available"
     confidence: float = 0.5
 
     evidence: Dict[str, Any] = field(default_factory=dict)
@@ -274,6 +285,7 @@ class ResourceDiagnosis:
             "overlap_ratio": self.overlap_ratio,
             "dose_response_score": self.dose_response_score,
             "resource_hint": self.resource_hint,
+            "warp_block_verdict": self.warp_block_verdict,
             "confidence": self.confidence,
             "evidence": self.evidence,
         }

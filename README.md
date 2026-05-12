@@ -258,15 +258,20 @@ template = matcher.match_kernel(record)
 ### 8.1 诊断工作流
 
 ```bash
-PYTHONPATH=. python -m weaver.weaver.diagnose.cli \
+PYTHONPATH=. python -m weaver.diagnose.cli \
 	--timeline ./out/aligned_timeline_rank0.ndjson \
-	--sketch ./out/execution_sketch_rank0.json \
+	--sketch ./examples/manual_expected_sketch.json \
 	--rank 0 \
 	--output ./diagnosis_rank0.json \
 	--output-html ./diagnosis_rank0.html \
 	--output-text ./diagnosis_rank0.txt \
 	--verbose
 ```
+
+`--sketch` is intended to be a manually written expected sketch in the current
+prototype. See `examples/manual_expected_sketch.json` for the compact format:
+use `expected_dependencies` to describe expected predecessor relationships and
+`overlap_expectations` to describe relationships that may/should overlap.
 
 ### 8.2 诊断流程
 

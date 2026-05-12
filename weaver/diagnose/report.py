@@ -47,12 +47,15 @@ class DiagnosisReporter:
         """
         # 分组报告
         reports_by_target = {}
+        kernel_index = {k.kid: k for k in kernel_records or []}
 
         # 处理每个候选
         for candidate in candidates:
             target_id = candidate.target_id
             if target_id not in reports_by_target:
-                reports_by_target[target_id] = self._create_target_report(target_id)
+                reports_by_target[target_id] = self._create_target_report(
+                    target_id, kernel_index.get(target_id)
+                )
 
             # 关联诊断信息
             if target_id in slowdown_diagnoses:
@@ -70,12 +73,14 @@ class DiagnosisReporter:
             reports_by_target[target_id]["candidates"].append(candidate.to_dict())
 
         # 生成摘要
+        root_causes = self._build_root_cause_reports(reports_by_target, kernel_index)
         summary = self._generate_summary(reports_by_target, slowdown_diagnoses)
 
         # 汇总报告
         full_report = {
             "rank": self.rank,
             "summary": summary,
+            "root_causes": root_causes,
             "targets": reports_by_target,
             "metadata": {
                 "total_candidates": len(candidates),
@@ -87,15 +92,115 @@ class DiagnosisReporter:
 
         return full_report
 
-    def _create_target_report(self, target_id: str) -> Dict[str, Any]:
+    def _create_target_report(self,
+                              target_id: str,
+                              kernel: Optional[KernelRecord] = None) -> Dict[str, Any]:
         """创建单个 target 的报告框架。"""
+        target_info = None
+        if kernel is not None:
+            target_info = {
+                "kernel_name": kernel.kernel_name,
+                "family": kernel.family,
+                "tag": kernel.tag,
+                "rank": kernel.rank,
+                "stream": kernel.stream,
+                "gpu_start_ns": kernel.gpu_start_ns,
+                "gpu_end_ns": kernel.gpu_end_ns,
+                "gpu_dur_ns": kernel.gpu_dur_ns,
+                "cpu_enqueue_start_ns": kernel.cpu_enqueue_start_ns,
+                "cpu_enqueue_end_ns": kernel.cpu_enqueue_end_ns,
+                "work_type": kernel.work_type,
+                "work_value": kernel.work_value,
+                "progress": kernel.progress(),
+            }
         return {
             "target_id": target_id,
+            "target": target_info,
             "candidates": [],
             "slowdown": None,
             "dependency": None,
             "resource": None,
         }
+
+    def _build_root_cause_reports(self,
+                                  reports: Dict[str, Dict],
+                                  kernel_index: Dict[str, KernelRecord]) -> List[Dict[str, Any]]:
+        """生成 slide 15 对应的根因报告摘要。"""
+        root_causes = []
+        for target_id, report in reports.items():
+            slowdown = report.get("slowdown") or {}
+            dependency = report.get("dependency")
+            resource = report.get("resource")
+            target = report.get("target") or {}
+
+            abnormal_type = slowdown.get("slowdown_type", "uncertain")
+            evidence_chain = []
+            if slowdown.get("evidence"):
+                evidence_chain.append(slowdown["evidence"].get("decision", slowdown["evidence"].get("reason")))
+
+            root = None
+            slowdown_estimate_ns = None
+            if dependency:
+                blocker_id = dependency["blocker_id"]
+                blocker_kernel = kernel_index.get(blocker_id)
+                root = {
+                    "type": "dependency_blocker",
+                    "id": blocker_id,
+                    "kind": dependency.get("blocker_kind"),
+                    "name": (
+                        blocker_kernel.kernel_name
+                        if blocker_kernel is not None
+                        else dependency.get("evidence", {}).get("blocker_name")
+                    ),
+                }
+                slowdown_estimate_ns = dependency.get("delay_ns")
+                evidence_chain.extend([
+                    "blocker ends close to target start",
+                    "counterfactual start is earlier",
+                ])
+                if dependency.get("overlap_loss_ns"):
+                    evidence_chain.append("counterfactual overlap would recover")
+            elif resource:
+                culprit_id = resource["culprit_id"]
+                culprit_kernel = kernel_index.get(culprit_id)
+                root = {
+                    "type": "resource_interference",
+                    "id": culprit_id,
+                    "kind": "kernel",
+                    "name": culprit_kernel.kernel_name if culprit_kernel is not None else resource.get("evidence", {}).get("culprit_kernel"),
+                    "resource_hint": resource.get("resource_hint"),
+                }
+                evidence_chain.extend([
+                    "target progress is lower than comparable kernels",
+                    "culprit overlaps target execution",
+                ])
+                if resource.get("dose_response_score", 0) > 0:
+                    evidence_chain.append("larger overlap correlates with lower progress")
+                if resource.get("warp_block_verdict") == "broad_slowdown":
+                    evidence_chain.append("warp/block distribution supports broad slowdown")
+                elif resource.get("warp_block_verdict") == "internal_tail":
+                    evidence_chain.append("warp/block distribution points to internal tail risk")
+
+            if root is None and abnormal_type == "uncertain":
+                continue
+
+            root_causes.append({
+                "target_id": target_id,
+                "target_kernel": target.get("kernel_name"),
+                "target_family": target.get("family"),
+                "abnormal_type": abnormal_type,
+                "root_cause": root,
+                "slowdown_estimate_ns": slowdown_estimate_ns,
+                "confidence": max(
+                    slowdown.get("confidence", 0),
+                    (dependency or {}).get("confidence", 0),
+                    (resource or {}).get("confidence", 0),
+                ),
+                "evidence_chain": [item for item in evidence_chain if item],
+            })
+
+        root_causes.sort(key=lambda item: item["confidence"], reverse=True)
+        return root_causes
 
     def _generate_summary(self,
                          reports: Dict[str, Dict],
@@ -189,10 +294,23 @@ class DiagnosisReporter:
                 lines.append(f"  {item['kernel_id']}: {item['count']} 次")
             lines.append("")
 
+        if report.get("root_causes"):
+            lines.append("【根因摘要】")
+            for item in report["root_causes"][:10]:
+                root = item.get("root_cause") or {}
+                lines.append(
+                    f"  Target {item['target_id']} ({item.get('target_kernel')}): "
+                    f"{item['abnormal_type']} -> {root.get('name', 'unknown')} "
+                    f"(confidence={item['confidence']:.2%})"
+                )
+            lines.append("")
+
         # 详细目标报告
         lines.append("【详细诊断】")
         for target_id, target_report in report["targets"].items():
-            lines.append(f"\nTarget Kernel: {target_id}")
+            target_info = target_report.get("target") or {}
+            title = target_info.get("kernel_name") or target_id
+            lines.append(f"\nTarget Kernel: {target_id} ({title})")
             lines.append("-" * 60)
 
             if target_report["slowdown"]:

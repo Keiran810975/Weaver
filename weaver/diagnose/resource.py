@@ -29,7 +29,8 @@ class ResourceLocalizer:
     """资源干扰定位。"""
 
     def __init__(self,
-                 min_overlap_ratio: float = 0.1):
+                 min_overlap_ratio: float = 0.1,
+                 progress_ratio_threshold: float = 0.7):
         """
         初始化定位器。
         
@@ -37,6 +38,7 @@ class ResourceLocalizer:
             min_overlap_ratio: 最小 overlap 比例阈值
         """
         self.min_overlap_ratio = min_overlap_ratio
+        self.progress_ratio_threshold = progress_ratio_threshold
 
     def localize(self,
                  target: KernelRecord,
@@ -91,9 +93,13 @@ class ResourceLocalizer:
         # Step 6: 资源兼容性
         resource_hint, compat_score = self._get_resource_compatibility(target, culprit)
 
+        # Step 7: warp/block 证据。当前 collector 可能只有 launch-derived warp 字段；
+        # 如果未来接入 Neutrino probe，这里会自动消费 block/warp 分位数。
+        warp_block_evidence = self._extract_warp_block_evidence(target, all_kernels)
+
         # 综合置信度
         confidence = self._compute_confidence(
-            score, same_run_diff, dose_response_score, compat_score
+            score, same_run_diff, dose_response_score, compat_score, warp_block_evidence
         )
 
         return ResourceDiagnosis(
@@ -104,6 +110,7 @@ class ResourceLocalizer:
             overlap_ratio=overlap_rel.overlap_ratio_target,
             dose_response_score=dose_response_score,
             resource_hint=resource_hint,
+            warp_block_verdict=warp_block_evidence["verdict"],
             confidence=confidence,
             evidence={
                 "culprit_kernel": culprit.kernel_name,
@@ -112,6 +119,8 @@ class ResourceLocalizer:
                 "overlap_ns": overlap_rel.overlap_ns,
                 "same_run_differential": same_run_diff,
                 "resource_compatibility": compat_score,
+                "witness_score": score,
+                "warp_block": warp_block_evidence,
             },
         )
 
@@ -123,7 +132,7 @@ class ResourceLocalizer:
         peers = [k for k in all_kernels 
                 if k.family == target.family and k.tag == target.tag and k.kid != target.kid]
 
-        if len(peers) < 2:
+        if len(peers) < 1:
             return False
 
         peer_progresses = [p.progress() for p in peers if p.progress()]
@@ -131,7 +140,7 @@ class ResourceLocalizer:
             return False
 
         median = statistics.median(peer_progresses)
-        return target.progress() < median * 0.7
+        return target.progress() < median * self.progress_ratio_threshold
 
     def _find_overlap_witnesses(self,
                                target: KernelRecord,
@@ -221,13 +230,13 @@ class ResourceLocalizer:
         # 找同类的其他 target
         peers = [k for k in all_kernels
                 if k.family == target.family and k.tag == target.tag 
-                and k.kid != target.kid]
+                and k.kid not in {target.kid, witness.kid}]
 
-        if len(peers) < 2:
+        if len(peers) < 1:
             return None
 
         # 分组：有 witness overlap 和没有
-        with_witness = []
+        with_witness = [target]
         without_witness = []
 
         for peer in peers:
@@ -268,14 +277,14 @@ class ResourceLocalizer:
         """
         peers = [k for k in all_kernels
                 if k.family == target.family and k.tag == target.tag 
-                and k.kid != target.kid]
+                and k.kid not in {target.kid, witness.kid}]
 
-        if len(peers) < 3:
+        if len(peers) < 2:
             return 0.0
 
         # 收集 (overlap_ratio, progress) 对
         data = []
-        for peer in peers:
+        for peer in [target] + peers:
             overlap = self._compute_interval_overlap(peer, witness)
             peer_dur = peer.gpu_dur_ns or 1
             overlap_ratio = overlap / peer_dur
@@ -337,11 +346,93 @@ class ResourceLocalizer:
 
         return None
 
+    def _extract_warp_block_evidence(self,
+                                     target: KernelRecord,
+                                     all_kernels: List[KernelRecord]) -> Dict[str, object]:
+        """
+        提取硬件层证据。
+
+        支持两类输入：
+        1. 当前 Weaver 已有的 launch-derived 字段：total_warps/warps_per_block。
+        2. 未来 Neutrino probe 注入后的 runtime 分位数字段：
+           block_duration_p50_ns / block_duration_p99_ns / warp_duration_p50_ns / warp_duration_p99_ns。
+        """
+        payload = target.payload or {}
+        p50 = self._first_number(payload, [
+            "block_duration_p50_ns", "block_p50_ns", "warp_duration_p50_ns", "warp_p50_ns"
+        ])
+        p99 = self._first_number(payload, [
+            "block_duration_p99_ns", "block_p99_ns", "warp_duration_p99_ns", "warp_p99_ns"
+        ])
+
+        evidence: Dict[str, object] = {
+            "available": False,
+            "verdict": "not_available",
+            "total_warps": target.total_warps,
+            "note": "only launch-derived warp count is available"
+        }
+
+        if p50 is None or p99 is None or p50 <= 0:
+            if target.total_warps:
+                evidence["available"] = True
+                evidence["verdict"] = "launch_derived_only"
+            return evidence
+
+        ratio = p99 / p50
+        evidence.update({
+            "available": True,
+            "block_or_warp_p50_ns": p50,
+            "block_or_warp_p99_ns": p99,
+            "p99_p50_ratio": ratio,
+        })
+
+        peer_p50 = []
+        peer_p99 = []
+        for peer in all_kernels:
+            if peer.kid == target.kid or peer.family != target.family or peer.tag != target.tag:
+                continue
+            peer_payload = peer.payload or {}
+            q50 = self._first_number(peer_payload, [
+                "block_duration_p50_ns", "block_p50_ns", "warp_duration_p50_ns", "warp_p50_ns"
+            ])
+            q99 = self._first_number(peer_payload, [
+                "block_duration_p99_ns", "block_p99_ns", "warp_duration_p99_ns", "warp_p99_ns"
+            ])
+            if q50 is not None:
+                peer_p50.append(q50)
+            if q99 is not None:
+                peer_p99.append(q99)
+
+        median_p50 = statistics.median(peer_p50) if peer_p50 else None
+        median_p99 = statistics.median(peer_p99) if peer_p99 else None
+        evidence["peer_p50_median_ns"] = median_p50
+        evidence["peer_p99_median_ns"] = median_p99
+
+        if ratio >= 3.0 and (median_p50 is None or p50 <= median_p50 * 1.3):
+            evidence["verdict"] = "internal_tail"
+            evidence["note"] = "p99 is high while p50 is not broadly shifted; this looks like target-internal tail"
+        elif median_p50 is not None and p50 > median_p50 * 1.3:
+            evidence["verdict"] = "broad_slowdown"
+            evidence["note"] = "p50 and tail move together; this supports external resource interference"
+        else:
+            evidence["verdict"] = "inconclusive"
+            evidence["note"] = "runtime warp/block samples exist but do not strongly separate tail from broad slowdown"
+
+        return evidence
+
+    def _first_number(self, payload: Dict[str, object], keys: List[str]) -> Optional[float]:
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+
     def _compute_confidence(self,
                            witness_score: float,
                            same_run_diff: Optional[float],
                            dose_response_score: float,
-                           compat_score: float) -> float:
+                           compat_score: float,
+                           warp_block_evidence: Dict[str, object]) -> float:
         """综合计算置信度。"""
         confidence = witness_score * 0.4
 
@@ -352,7 +443,15 @@ class ResourceLocalizer:
 
         confidence += compat_score * 0.1
 
-        return min(0.95, confidence)
+        verdict = warp_block_evidence.get("verdict")
+        if verdict == "broad_slowdown":
+            confidence += 0.12
+        elif verdict == "internal_tail":
+            confidence -= 0.18
+        elif verdict == "launch_derived_only":
+            confidence += 0.02
+
+        return max(0.05, min(0.95, confidence))
 
     def localize_batch(self,
                       targets: List[KernelRecord],

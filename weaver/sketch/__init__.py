@@ -13,6 +13,7 @@ from .schema import (
     DependencyType,
     OverlapRelation,
     OverlapExpectation,
+    ExpectedDependency,
     ExecutionSketch,
     KernelClass,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "DependencyType",
     "OverlapRelation",
     "OverlapExpectation",
+    "ExpectedDependency",
     "ExecutionSketch",
     "KernelClass",
     "classify_kernel",

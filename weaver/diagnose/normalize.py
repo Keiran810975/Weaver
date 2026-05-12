@@ -36,6 +36,17 @@ def _get_first(event: Dict[str, Any], keys: List[str], default: Any = None) -> A
     return default
 
 
+def _number(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        if isinstance(value, str) and value.strip():
+            return float(value)
+    except ValueError:
+        return None
+    return None
+
+
 class TimelineNormalizer:
     """从 aligned timeline 转换为规范化记录。"""
 
@@ -195,7 +206,19 @@ class TimelineNormalizer:
         work_type = "unknown"
         work_value = None
 
-        if kclass.family == "NCCL":
+        explicit_flops = _number(_get_first(event, ["flops", "FLOPs", "floating_point_ops"]))
+        m = _number(_get_first(event, ["m", "M"]))
+        n = _number(_get_first(event, ["n", "N"]))
+        k = _number(_get_first(event, ["k", "K"]))
+        batch = _number(_get_first(event, ["batch", "batch_size"], 1.0)) or 1.0
+
+        if explicit_flops is not None:
+            work_type = "flops"
+            work_value = explicit_flops
+        elif kclass.family == "GEMM" and m and n and k:
+            work_type = "flops"
+            work_value = 2.0 * batch * m * n * k
+        elif kclass.family == "NCCL":
             work_type = "bytes"
             count = payload.get("count", 0)
             dtype_size = payload.get("dtype_size", 4)

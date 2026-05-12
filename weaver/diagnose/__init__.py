@@ -34,8 +34,6 @@ from .resource import ResourceLocalizer
 
 from .report import DiagnosisReporter
 
-from . import cli
-
 __all__ = [
     # Records
     "SyncKind",
@@ -55,6 +53,4 @@ __all__ = [
     "DependencyLocalizer",
     "ResourceLocalizer",
     "DiagnosisReporter",
-    # CLI
-    "cli",
 ]
