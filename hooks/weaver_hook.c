@@ -104,6 +104,7 @@ typedef ncclResult_t (*ncclReduceScatter_t)(const void*, void*, size_t,
 typedef ncclResult_t (*ncclBroadcast_t)(const void*, void*, size_t,
                                         ncclDataType_t, int, ncclComm_t,
                                         CUstream);
+typedef void* (*dlsym_fn_t)(void*, const char*);
 
 static cuModuleLoadData_t real_cuModuleLoadData = NULL;
 static cuModuleLoadDataEx_t real_cuModuleLoadDataEx = NULL;
@@ -218,10 +219,29 @@ static int env_flag(const char* name, int default_value) {
              strcasecmp(value, "off") == 0 || strcasecmp(value, "no") == 0);
 }
 
+static dlsym_fn_t real_dlsym_func = NULL;
+
+static dlsym_fn_t get_real_dlsym(void) {
+#ifdef __linux__
+    if (!real_dlsym_func) {
+        real_dlsym_func = (dlsym_fn_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+        if (!real_dlsym_func) {
+            real_dlsym_func = (dlsym_fn_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+        }
+    }
+#else
+    if (!real_dlsym_func) {
+        real_dlsym_func = dlsym;
+    }
+#endif
+    return real_dlsym_func;
+}
+
 static void* dlsym_next_any(const char* name, const char* alt_name) {
-    void* fn = dlsym(RTLD_NEXT, name);
+    dlsym_fn_t real_dlsym = get_real_dlsym();
+    void* fn = real_dlsym ? real_dlsym(RTLD_NEXT, name) : NULL;
     if (!fn && alt_name) {
-        fn = dlsym(RTLD_NEXT, alt_name);
+        fn = real_dlsym ? real_dlsym(RTLD_NEXT, alt_name) : NULL;
     }
     return fn;
 }
@@ -317,16 +337,16 @@ static void refresh_runtime_symbols(void) {
 
 static void refresh_nccl_symbols(void) {
     if (!real_ncclAllReduce) {
-        real_ncclAllReduce = (ncclAllReduce_t)dlsym(RTLD_NEXT, "ncclAllReduce");
+        real_ncclAllReduce = (ncclAllReduce_t)dlsym_next_any("ncclAllReduce", NULL);
     }
     if (!real_ncclAllGather) {
-        real_ncclAllGather = (ncclAllGather_t)dlsym(RTLD_NEXT, "ncclAllGather");
+        real_ncclAllGather = (ncclAllGather_t)dlsym_next_any("ncclAllGather", NULL);
     }
     if (!real_ncclReduceScatter) {
-        real_ncclReduceScatter = (ncclReduceScatter_t)dlsym(RTLD_NEXT, "ncclReduceScatter");
+        real_ncclReduceScatter = (ncclReduceScatter_t)dlsym_next_any("ncclReduceScatter", NULL);
     }
     if (!real_ncclBroadcast) {
-        real_ncclBroadcast = (ncclBroadcast_t)dlsym(RTLD_NEXT, "ncclBroadcast");
+        real_ncclBroadcast = (ncclBroadcast_t)dlsym_next_any("ncclBroadcast", NULL);
     }
 }
 
@@ -1633,76 +1653,135 @@ cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_runtime* config,
                                     "runtime_ex_ptsz_cpu_enqueue_fallback");
 }
 
+CUresult cuGetProcAddress(const char* symbol,
+                          void** pfn,
+                          int cudaVersion,
+                          uint64_t flags,
+                          void* symbolStatus);
+CUresult cuGetProcAddress_v2(const char* symbol,
+                             void** pfn,
+                             int cudaVersion,
+                             uint64_t flags,
+                             void* symbolStatus);
+
+static void* patch_symbol_pointer(const char* symbol, void* pfn) {
+    if (!symbol || !pfn) {
+        return pfn;
+    }
+    if (strcmp(symbol, "cuModuleLoadData") == 0) {
+        if (!real_cuModuleLoadData) {
+            real_cuModuleLoadData = (cuModuleLoadData_t)pfn;
+        }
+        return (void*)cuModuleLoadData;
+    } else if (strcmp(symbol, "cuModuleLoadDataEx") == 0) {
+        if (!real_cuModuleLoadDataEx) {
+            real_cuModuleLoadDataEx = (cuModuleLoadDataEx_t)pfn;
+        }
+        return (void*)cuModuleLoadDataEx;
+    } else if (strcmp(symbol, "cuModuleLoadFatBinary") == 0) {
+        if (!real_cuModuleLoadFatBinary) {
+            real_cuModuleLoadFatBinary = (cuModuleLoadFatBinary_t)pfn;
+        }
+        return (void*)cuModuleLoadFatBinary;
+    } else if (strcmp(symbol, "cuModuleGetFunction") == 0) {
+        if (!real_cuModuleGetFunction) {
+            real_cuModuleGetFunction = (cuModuleGetFunction_t)pfn;
+        }
+        return (void*)cuModuleGetFunction;
+    } else if (strcmp(symbol, "cuKernelGetFunction") == 0) {
+        if (!real_cuKernelGetFunction) {
+            real_cuKernelGetFunction = (cuKernelGetFunction_t)pfn;
+        }
+        return (void*)cuKernelGetFunction;
+    } else if (strcmp(symbol, "cuLibraryLoadData") == 0) {
+        if (!real_cuLibraryLoadData) {
+            real_cuLibraryLoadData = (cuLibraryLoadData_t)pfn;
+        }
+        return (void*)cuLibraryLoadData;
+    } else if (strcmp(symbol, "cuLibraryGetKernel") == 0) {
+        if (!real_cuLibraryGetKernel) {
+            real_cuLibraryGetKernel = (cuLibraryGetKernel_t)pfn;
+        }
+        return (void*)cuLibraryGetKernel;
+    } else if (strcmp(symbol, "cuLibraryGetModule") == 0) {
+        if (!real_cuLibraryGetModule) {
+            real_cuLibraryGetModule = (cuLibraryGetModule_t)pfn;
+        }
+        return (void*)cuLibraryGetModule;
+    } else if (strcmp(symbol, "cuFuncGetName") == 0) {
+        if (!real_cuFuncGetName) {
+            real_cuFuncGetName = (cuFuncGetName_t)pfn;
+        }
+        return (void*)cuFuncGetName;
+    } else if (strcmp(symbol, "cuLaunchKernel") == 0) {
+        if (!real_cuLaunchKernel) {
+            real_cuLaunchKernel = (cuLaunchKernel_t)pfn;
+        }
+        return (void*)cuLaunchKernel;
+    } else if (strcmp(symbol, "cuLaunchKernel_ptsz") == 0) {
+        if (!real_cuLaunchKernel_ptsz) {
+            real_cuLaunchKernel_ptsz = (cuLaunchKernel_t)pfn;
+        }
+        return (void*)cuLaunchKernel_ptsz;
+    } else if (strcmp(symbol, "cuLaunchKernelEx") == 0) {
+        if (!real_cuLaunchKernelEx) {
+            real_cuLaunchKernelEx = (cuLaunchKernelEx_t)pfn;
+        }
+        return (void*)cuLaunchKernelEx;
+    } else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) {
+        if (!real_cuLaunchKernelEx_ptsz) {
+            real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)pfn;
+        }
+        return (void*)cuLaunchKernelEx_ptsz;
+    } else if (strcmp(symbol, "cudaLaunchKernel") == 0) {
+        if (!real_cudaLaunchKernel) {
+            real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)pfn;
+        }
+        return (void*)cudaLaunchKernel;
+    } else if (strcmp(symbol, "cudaLaunchKernel_ptsz") == 0) {
+        if (!real_cudaLaunchKernel_ptsz) {
+            real_cudaLaunchKernel_ptsz = (cudaLaunchKernel_runtime_t)pfn;
+        }
+        return (void*)cudaLaunchKernel_ptsz;
+    } else if (strcmp(symbol, "cudaLaunchCooperativeKernel") == 0) {
+        if (!real_cudaLaunchCooperativeKernel) {
+            real_cudaLaunchCooperativeKernel = (cudaLaunchCooperativeKernel_t)pfn;
+        }
+        return (void*)cudaLaunchCooperativeKernel;
+    } else if (strcmp(symbol, "cudaLaunchCooperativeKernel_ptsz") == 0) {
+        if (!real_cudaLaunchCooperativeKernel_ptsz) {
+            real_cudaLaunchCooperativeKernel_ptsz = (cudaLaunchCooperativeKernel_t)pfn;
+        }
+        return (void*)cudaLaunchCooperativeKernel_ptsz;
+    } else if (strcmp(symbol, "cudaLaunchKernelExC") == 0) {
+        if (!real_cudaLaunchKernelExC) {
+            real_cudaLaunchKernelExC = (cudaLaunchKernelExC_t)pfn;
+        }
+        return (void*)cudaLaunchKernelExC;
+    } else if (strcmp(symbol, "cudaLaunchKernelExC_ptsz") == 0) {
+        if (!real_cudaLaunchKernelExC_ptsz) {
+            real_cudaLaunchKernelExC_ptsz = (cudaLaunchKernelExC_t)pfn;
+        }
+        return (void*)cudaLaunchKernelExC_ptsz;
+    } else if (strcmp(symbol, "cuGetProcAddress") == 0) {
+        if (!real_cuGetProcAddress) {
+            real_cuGetProcAddress = (cuGetProcAddress_t)pfn;
+        }
+        return (void*)cuGetProcAddress;
+    } else if (strcmp(symbol, "cuGetProcAddress_v2") == 0) {
+        if (!real_cuGetProcAddress_v2) {
+            real_cuGetProcAddress_v2 = (cuGetProcAddress_t)pfn;
+        }
+        return (void*)cuGetProcAddress_v2;
+    }
+    return pfn;
+}
+
 static void patch_driver_proc_address(const char* symbol, void** pfn) {
     if (!symbol || !pfn || !*pfn) {
         return;
     }
-    if (strcmp(symbol, "cuModuleLoadData") == 0) {
-        if (!real_cuModuleLoadData) {
-            real_cuModuleLoadData = (cuModuleLoadData_t)(*pfn);
-        }
-        *pfn = (void*)cuModuleLoadData;
-    } else if (strcmp(symbol, "cuModuleLoadDataEx") == 0) {
-        if (!real_cuModuleLoadDataEx) {
-            real_cuModuleLoadDataEx = (cuModuleLoadDataEx_t)(*pfn);
-        }
-        *pfn = (void*)cuModuleLoadDataEx;
-    } else if (strcmp(symbol, "cuModuleLoadFatBinary") == 0) {
-        if (!real_cuModuleLoadFatBinary) {
-            real_cuModuleLoadFatBinary = (cuModuleLoadFatBinary_t)(*pfn);
-        }
-        *pfn = (void*)cuModuleLoadFatBinary;
-    } else if (strcmp(symbol, "cuModuleGetFunction") == 0) {
-        if (!real_cuModuleGetFunction) {
-            real_cuModuleGetFunction = (cuModuleGetFunction_t)(*pfn);
-        }
-        *pfn = (void*)cuModuleGetFunction;
-    } else if (strcmp(symbol, "cuKernelGetFunction") == 0) {
-        if (!real_cuKernelGetFunction) {
-            real_cuKernelGetFunction = (cuKernelGetFunction_t)(*pfn);
-        }
-        *pfn = (void*)cuKernelGetFunction;
-    } else if (strcmp(symbol, "cuLibraryLoadData") == 0) {
-        if (!real_cuLibraryLoadData) {
-            real_cuLibraryLoadData = (cuLibraryLoadData_t)(*pfn);
-        }
-        *pfn = (void*)cuLibraryLoadData;
-    } else if (strcmp(symbol, "cuLibraryGetKernel") == 0) {
-        if (!real_cuLibraryGetKernel) {
-            real_cuLibraryGetKernel = (cuLibraryGetKernel_t)(*pfn);
-        }
-        *pfn = (void*)cuLibraryGetKernel;
-    } else if (strcmp(symbol, "cuLibraryGetModule") == 0) {
-        if (!real_cuLibraryGetModule) {
-            real_cuLibraryGetModule = (cuLibraryGetModule_t)(*pfn);
-        }
-        *pfn = (void*)cuLibraryGetModule;
-    } else if (strcmp(symbol, "cuFuncGetName") == 0) {
-        if (!real_cuFuncGetName) {
-            real_cuFuncGetName = (cuFuncGetName_t)(*pfn);
-        }
-        *pfn = (void*)cuFuncGetName;
-    } else if (strcmp(symbol, "cuLaunchKernel") == 0) {
-        if (!real_cuLaunchKernel) {
-            real_cuLaunchKernel = (cuLaunchKernel_t)(*pfn);
-        }
-        *pfn = (void*)cuLaunchKernel;
-    } else if (strcmp(symbol, "cuLaunchKernel_ptsz") == 0) {
-        if (!real_cuLaunchKernel_ptsz) {
-            real_cuLaunchKernel_ptsz = (cuLaunchKernel_t)(*pfn);
-        }
-        *pfn = (void*)cuLaunchKernel_ptsz;
-    } else if (strcmp(symbol, "cuLaunchKernelEx") == 0) {
-        if (!real_cuLaunchKernelEx) {
-            real_cuLaunchKernelEx = (cuLaunchKernelEx_t)(*pfn);
-        }
-        *pfn = (void*)cuLaunchKernelEx;
-    } else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) {
-        if (!real_cuLaunchKernelEx_ptsz) {
-            real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)(*pfn);
-        }
-        *pfn = (void*)cuLaunchKernelEx_ptsz;
-    }
+    *pfn = patch_symbol_pointer(symbol, *pfn);
 }
 
 static CUresult call_real_cu_get_proc_address(cuGetProcAddress_t getter,
@@ -1742,6 +1821,20 @@ CUresult cuGetProcAddress_v2(const char* symbol,
     cuGetProcAddress_t getter = real_cuGetProcAddress_v2 ? real_cuGetProcAddress_v2 : real_cuGetProcAddress;
     return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus);
 }
+
+#ifdef __linux__
+void* dlsym(void* handle, const char* symbol) {
+    dlsym_fn_t real_dlsym = get_real_dlsym();
+    if (!real_dlsym) {
+        return NULL;
+    }
+    if (symbol && strcmp(symbol, "dlsym") == 0) {
+        return (void*)real_dlsym;
+    }
+    void* fn = real_dlsym(handle, symbol);
+    return patch_symbol_pointer(symbol, fn);
+}
+#endif
 
 static void send_nccl_event(const char* kind, size_t count, int ret,
                             long long start_ns, long long end_ns) {
