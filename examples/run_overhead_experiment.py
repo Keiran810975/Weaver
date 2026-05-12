@@ -187,6 +187,10 @@ def mode_env(mode: str, rep: int, run_dir: Path, sock: Optional[Path], python: s
     env["WEAVER_OVERHEAD_MODE"] = mode
     env["WEAVER_OVERHEAD_REP"] = str(rep)
 
+    # Avoid NCCL init failures observed with LD_PRELOAD hooks on some systems.
+    env.setdefault("NCCL_P2P_DISABLE", "1")
+    env.setdefault("NCCL_IB_DISABLE", "1")
+
     if sock is not None:
         env["WEAVER_SOCK"] = str(sock)
 

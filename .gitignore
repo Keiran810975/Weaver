@@ -1,0 +1,10 @@
+# Experiment outputs
+out/
+out_mp/
+overhead_out/
+overhead_out_*/
+overhead_v100_*/
+weaver_events.ndjson
+
+# Python cache
+__pycache__/
