@@ -248,7 +248,7 @@ def mode_env(
         env.setdefault("WEAVER_CUDA_EVENTS", "0")
         env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "0")
         env.setdefault("WEAVER_CUDA_EVENT_POOL", "1")
-        env["WEAVER_PATCH_DLSYM"] = "0"
+        env["WEAVER_PATCH_DLSYM"] = "1"
         env.setdefault("WEAVER_PATCH_GETPROC", "1")
         env["WEAVER_TRACE_DIR"] = str(run_dir / "captured_kernels")
         env.setdefault("WEAVER_ENABLE_DISASM", "0")
@@ -354,6 +354,38 @@ def has_measured_step_metrics(out_dir: Path, mode: str, rep: int, expected_ranks
     return True
 
 
+def validate_weaver_event_coverage(mode: str, events: Dict[str, object], log_path: Path) -> None:
+    by_layer = events.get("by_layer") or {}
+    by_kind = events.get("by_kind") or {}
+    if needs_hook(mode):
+        if int(by_layer.get("hook", 0)) <= 0:
+            tail = read_log_tail(log_path)
+            detail = (
+                f"{mode} produced no LD_PRELOAD hook init events; "
+                "CUDA/NCCL hook collection is not active"
+            )
+            if tail:
+                detail += f"\n--- torchrun.log tail ---\n{tail}"
+            raise RuntimeError(detail)
+        if mode in {"weaver_full", "weaver_no_disasm", "weaver_kernel_only"}:
+            if int(by_kind.get("kernel_launch", 0)) <= 0:
+                tail = read_log_tail(log_path)
+                detail = (
+                    f"{mode} produced no kernel_launch events; "
+                    "ordinary CUDA kernel collection is incomplete"
+                )
+                if tail:
+                    detail += f"\n--- torchrun.log tail ---\n{tail}"
+                raise RuntimeError(detail)
+    if mode in {"weaver_full", "weaver_no_disasm", "weaver_py_only"}:
+        if int(by_layer.get("python", 0)) <= 0:
+            tail = read_log_tail(log_path)
+            detail = f"{mode} produced no Python operator events"
+            if tail:
+                detail += f"\n--- torchrun.log tail ---\n{tail}"
+            raise RuntimeError(detail)
+
+
 def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dict[str, object]:
     run_dir = out_dir / mode / f"rep_{rep}"
     if run_dir.exists():
@@ -382,13 +414,14 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
         with log_path.open("w", encoding="utf-8") as log:
             proc = subprocess.run(cmd, cwd=str(ROOT), env=env, stdout=log, stderr=subprocess.STDOUT)
         elapsed_s = time.perf_counter() - started
+        weaver_events = count_weaver_events(weaver_file)
         result = {
             "mode": mode,
             "repetition": rep,
             "returncode": proc.returncode,
             "elapsed_s": elapsed_s,
             "log": str(log_path),
-            "weaver_events": count_weaver_events(weaver_file),
+            "weaver_events": weaver_events,
         }
         with (run_dir / "run_result.json").open("w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=True, indent=2)
@@ -404,6 +437,7 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
             if tail:
                 detail += f"\n--- torchrun.log tail ---\n{tail}"
             raise RuntimeError(detail)
+        validate_weaver_event_coverage(mode, weaver_events, log_path)
         return result
     finally:
         stop_daemon(daemon)

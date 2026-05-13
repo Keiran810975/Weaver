@@ -326,6 +326,57 @@ static void* dlsym_next_any(const char* name, const char* alt_name) {
     return fn;
 }
 
+static int contains_text(const char* text, const char* needle) {
+    return text && needle && strstr(text, needle) != NULL;
+}
+
+static int __attribute__((unused)) is_interposable_cuda_symbol(const char* symbol) {
+    if (!symbol) {
+        return 0;
+    }
+    return strcmp(symbol, "cuModuleLoadData") == 0 ||
+           strcmp(symbol, "cuModuleLoadDataEx") == 0 ||
+           strcmp(symbol, "cuModuleLoadFatBinary") == 0 ||
+           strcmp(symbol, "cuModuleGetFunction") == 0 ||
+           strcmp(symbol, "cuKernelGetFunction") == 0 ||
+           strcmp(symbol, "cuLibraryLoadData") == 0 ||
+           strcmp(symbol, "cuLibraryGetKernel") == 0 ||
+           strcmp(symbol, "cuLibraryGetModule") == 0 ||
+           strcmp(symbol, "cuFuncGetName") == 0 ||
+           strcmp(symbol, "cuLaunchKernel") == 0 ||
+           strcmp(symbol, "cuLaunchKernel_ptsz") == 0 ||
+           strcmp(symbol, "cuLaunchKernelEx") == 0 ||
+           strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0 ||
+           strcmp(symbol, "cudaLaunchKernel") == 0 ||
+           strcmp(symbol, "cudaLaunchKernel_ptsz") == 0 ||
+           strcmp(symbol, "cudaLaunchCooperativeKernel") == 0 ||
+           strcmp(symbol, "cudaLaunchCooperativeKernel_ptsz") == 0 ||
+           strcmp(symbol, "cudaLaunchKernelExC") == 0 ||
+           strcmp(symbol, "cudaLaunchKernelExC_ptsz") == 0 ||
+           strcmp(symbol, "cuGetProcAddress") == 0 ||
+           strcmp(symbol, "cuGetProcAddress_v2") == 0;
+}
+
+static int is_blocked_interposer_caller(void* caller) {
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (!caller || !dladdr(caller, &info) || !info.dli_fname) {
+        return 0;
+    }
+    const char* path = info.dli_fname;
+    return contains_text(path, "/ucx/") ||
+           contains_text(path, "/hpcx/") ||
+           contains_text(path, "libucs") ||
+           contains_text(path, "libucp") ||
+           contains_text(path, "libuct") ||
+           contains_text(path, "libucm") ||
+           contains_text(path, "libmpi") ||
+           contains_text(path, "libopen-pal") ||
+           contains_text(path, "libopen-rte") ||
+           contains_text(path, "libhcoll") ||
+           contains_text(path, "libnccl");
+}
+
 static void refresh_getproc_symbols(void) {
     if (!real_cuGetProcAddress) {
         real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress", NULL);
@@ -2005,7 +2056,8 @@ static CUresult call_real_cu_get_proc_address(cuGetProcAddress_t getter,
                                               void** pfn,
                                               int cudaVersion,
                                               uint64_t flags,
-                                              void* symbolStatus) {
+                                              void* symbolStatus,
+                                              int patch_result) {
     if (!getter) {
         refresh_getproc_symbols();
         getter = real_cuGetProcAddress ? real_cuGetProcAddress : real_cuGetProcAddress_v2;
@@ -2018,11 +2070,11 @@ static CUresult call_real_cu_get_proc_address(cuGetProcAddress_t getter,
         if (!fn || !pfn) {
             return 1;
         }
-        *pfn = patch_symbol_pointer(symbol, fn);
+        *pfn = patch_result ? patch_symbol_pointer(symbol, fn) : fn;
         return CU_SUCCESS;
     }
     CUresult ret = getter(symbol, pfn, cudaVersion, flags, symbolStatus);
-    if (ret == CU_SUCCESS) {
+    if (ret == CU_SUCCESS && patch_result) {
         patch_driver_proc_address(symbol, pfn);
     } else if (g_trace_getproc_errors) {
         char escaped[256];
@@ -2042,13 +2094,14 @@ CUresult cuGetProcAddress(const char* symbol,
     init_once();
     refresh_getproc_symbols();
     cuGetProcAddress_t getter = real_cuGetProcAddress ? real_cuGetProcAddress : real_cuGetProcAddress_v2;
-    if (!g_patch_getproc) {
+    int patch_result = g_patch_getproc && !is_blocked_interposer_caller(__builtin_return_address(0));
+    if (!patch_result) {
         if (!getter || getter == cuGetProcAddress || getter == cuGetProcAddress_v2) {
             return 1;
         }
         return getter(symbol, pfn, cudaVersion, flags, symbolStatus);
     }
-    return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus);
+    return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus, patch_result);
 }
 
 CUresult cuGetProcAddress_v2(const char* symbol,
@@ -2059,13 +2112,14 @@ CUresult cuGetProcAddress_v2(const char* symbol,
     init_once();
     refresh_getproc_symbols();
     cuGetProcAddress_t getter = real_cuGetProcAddress_v2 ? real_cuGetProcAddress_v2 : real_cuGetProcAddress;
-    if (!g_patch_getproc) {
+    int patch_result = g_patch_getproc && !is_blocked_interposer_caller(__builtin_return_address(0));
+    if (!patch_result) {
         if (!getter || getter == cuGetProcAddress || getter == cuGetProcAddress_v2) {
             return 1;
         }
         return getter(symbol, pfn, cudaVersion, flags, symbolStatus);
     }
-    return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus);
+    return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus, patch_result);
 }
 
 #ifdef __linux__
@@ -2083,7 +2137,8 @@ void* dlsym(void* handle, const char* symbol) {
         return (void*)real_dlsym;
     }
     void* fn = real_dlsym(handle, sym);
-    if (!g_patch_dlsym) {
+    if (!g_patch_dlsym || !is_interposable_cuda_symbol(sym) ||
+        is_blocked_interposer_caller(__builtin_return_address(0))) {
         return fn;
     }
     return patch_symbol_pointer(sym, fn);
