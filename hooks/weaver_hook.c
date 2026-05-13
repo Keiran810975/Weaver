@@ -306,60 +306,120 @@ static void refresh_driver_symbols(void) {
     ensure_libcuda_loaded();
     if (!real_cuModuleLoadData) {
         real_cuModuleLoadData = (cuModuleLoadData_t)dlsym_next_any("cuModuleLoadData", NULL);
+        if (!real_cuModuleLoadData) {
+            real_cuModuleLoadData = (cuModuleLoadData_t)dlsym_libcuda("cuModuleLoadData");
+        }
     }
     if (!real_cuModuleLoadDataEx) {
         real_cuModuleLoadDataEx = (cuModuleLoadDataEx_t)dlsym_next_any("cuModuleLoadDataEx", NULL);
+        if (!real_cuModuleLoadDataEx) {
+            real_cuModuleLoadDataEx = (cuModuleLoadDataEx_t)dlsym_libcuda("cuModuleLoadDataEx");
+        }
     }
     if (!real_cuModuleLoadFatBinary) {
         real_cuModuleLoadFatBinary = (cuModuleLoadFatBinary_t)dlsym_next_any("cuModuleLoadFatBinary", NULL);
+        if (!real_cuModuleLoadFatBinary) {
+            real_cuModuleLoadFatBinary = (cuModuleLoadFatBinary_t)dlsym_libcuda("cuModuleLoadFatBinary");
+        }
     }
     if (!real_cuModuleGetFunction) {
         real_cuModuleGetFunction = (cuModuleGetFunction_t)dlsym_next_any("cuModuleGetFunction", NULL);
+        if (!real_cuModuleGetFunction) {
+            real_cuModuleGetFunction = (cuModuleGetFunction_t)dlsym_libcuda("cuModuleGetFunction");
+        }
     }
     if (!real_cuKernelGetFunction) {
         real_cuKernelGetFunction = (cuKernelGetFunction_t)dlsym_next_any("cuKernelGetFunction", NULL);
+        if (!real_cuKernelGetFunction) {
+            real_cuKernelGetFunction = (cuKernelGetFunction_t)dlsym_libcuda("cuKernelGetFunction");
+        }
     }
     if (!real_cuLibraryLoadData) {
         real_cuLibraryLoadData = (cuLibraryLoadData_t)dlsym_next_any("cuLibraryLoadData", NULL);
+        if (!real_cuLibraryLoadData) {
+            real_cuLibraryLoadData = (cuLibraryLoadData_t)dlsym_libcuda("cuLibraryLoadData");
+        }
     }
     if (!real_cuLibraryGetKernel) {
         real_cuLibraryGetKernel = (cuLibraryGetKernel_t)dlsym_next_any("cuLibraryGetKernel", NULL);
+        if (!real_cuLibraryGetKernel) {
+            real_cuLibraryGetKernel = (cuLibraryGetKernel_t)dlsym_libcuda("cuLibraryGetKernel");
+        }
     }
     if (!real_cuLibraryGetModule) {
         real_cuLibraryGetModule = (cuLibraryGetModule_t)dlsym_next_any("cuLibraryGetModule", NULL);
+        if (!real_cuLibraryGetModule) {
+            real_cuLibraryGetModule = (cuLibraryGetModule_t)dlsym_libcuda("cuLibraryGetModule");
+        }
     }
     if (!real_cuFuncGetName) {
         real_cuFuncGetName = (cuFuncGetName_t)dlsym_next_any("cuFuncGetName", NULL);
+        if (!real_cuFuncGetName) {
+            real_cuFuncGetName = (cuFuncGetName_t)dlsym_libcuda("cuFuncGetName");
+        }
     }
     if (!real_cuLaunchKernel) {
         real_cuLaunchKernel = (cuLaunchKernel_t)dlsym_next_any("cuLaunchKernel", NULL);
+        if (!real_cuLaunchKernel) {
+            real_cuLaunchKernel = (cuLaunchKernel_t)dlsym_libcuda("cuLaunchKernel");
+        }
     }
     if (!real_cuLaunchKernel_ptsz) {
         real_cuLaunchKernel_ptsz = (cuLaunchKernel_t)dlsym_next_any("cuLaunchKernel_ptsz", NULL);
+        if (!real_cuLaunchKernel_ptsz) {
+            real_cuLaunchKernel_ptsz = (cuLaunchKernel_t)dlsym_libcuda("cuLaunchKernel_ptsz");
+        }
     }
     if (!real_cuLaunchKernelEx) {
         real_cuLaunchKernelEx = (cuLaunchKernelEx_t)dlsym_next_any("cuLaunchKernelEx", NULL);
+        if (!real_cuLaunchKernelEx) {
+            real_cuLaunchKernelEx = (cuLaunchKernelEx_t)dlsym_libcuda("cuLaunchKernelEx");
+        }
     }
     if (!real_cuLaunchKernelEx_ptsz) {
         real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)dlsym_next_any("cuLaunchKernelEx_ptsz", NULL);
+        if (!real_cuLaunchKernelEx_ptsz) {
+            real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)dlsym_libcuda("cuLaunchKernelEx_ptsz");
+        }
     }
     if (!real_cuEventCreate) {
         real_cuEventCreate = (cuEventCreate_t)dlsym_next_any("cuEventCreate", NULL);
+        if (!real_cuEventCreate) {
+            real_cuEventCreate = (cuEventCreate_t)dlsym_libcuda("cuEventCreate");
+        }
     }
     if (!real_cuEventRecord) {
         real_cuEventRecord = (cuEventRecord_t)dlsym_next_any("cuEventRecord", NULL);
+        if (!real_cuEventRecord) {
+            real_cuEventRecord = (cuEventRecord_t)dlsym_libcuda("cuEventRecord");
+        }
     }
     if (!real_cuEventQuery) {
         real_cuEventQuery = (cuEventQuery_t)dlsym_next_any("cuEventQuery", NULL);
+        if (!real_cuEventQuery) {
+            real_cuEventQuery = (cuEventQuery_t)dlsym_libcuda("cuEventQuery");
+        }
     }
     if (!real_cuEventSynchronize) {
         real_cuEventSynchronize = (cuEventSynchronize_t)dlsym_next_any("cuEventSynchronize", NULL);
+        if (!real_cuEventSynchronize) {
+            real_cuEventSynchronize = (cuEventSynchronize_t)dlsym_libcuda("cuEventSynchronize");
+        }
     }
     if (!real_cuEventElapsedTime) {
         real_cuEventElapsedTime = (cuEventElapsedTime_t)dlsym_next_any("cuEventElapsedTime", NULL);
+        if (!real_cuEventElapsedTime) {
+            real_cuEventElapsedTime = (cuEventElapsedTime_t)dlsym_libcuda("cuEventElapsedTime");
+        }
     }
     if (!real_cuEventDestroy) {
         real_cuEventDestroy = (cuEventDestroy_t)dlsym_next_any("cuEventDestroy_v2", "cuEventDestroy");
+        if (!real_cuEventDestroy) {
+            real_cuEventDestroy = (cuEventDestroy_t)dlsym_libcuda("cuEventDestroy_v2");
+        }
+        if (!real_cuEventDestroy) {
+            real_cuEventDestroy = (cuEventDestroy_t)dlsym_libcuda("cuEventDestroy");
+        }
     }
     if (!real_cuGetProcAddress) {
         real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress", NULL);
@@ -1887,6 +1947,9 @@ static CUresult call_real_cu_get_proc_address(cuGetProcAddress_t getter,
         ensure_libcuda_loaded();
         refresh_driver_symbols();
         void* fn = dlsym_next_any(symbol, NULL);
+        if (!fn) {
+            fn = dlsym_libcuda(symbol);
+        }
         if (!fn || !pfn) {
             return 1;
         }

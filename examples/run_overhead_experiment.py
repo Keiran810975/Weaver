@@ -316,6 +316,22 @@ def count_weaver_events(path: Path) -> Dict[str, object]:
     }
 
 
+def has_measured_step_metrics(out_dir: Path, mode: str, rep: int) -> bool:
+    paths = sorted((out_dir / mode / f"rep_{rep}").glob("rank_*/step_metrics.jsonl"))
+    if not paths:
+        return False
+    for path in paths:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("measured"):
+                    return True
+    return False
+
+
 def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dict[str, object]:
     run_dir = out_dir / mode / f"rep_{rep}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +363,12 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
         if proc.returncode != 0:
             tail = read_log_tail(log_path)
             detail = f"{mode} rep {rep} failed; see {log_path}"
+            if tail:
+                detail += f"\n--- torchrun.log tail ---\n{tail}"
+            raise RuntimeError(detail)
+        if not has_measured_step_metrics(out_dir, mode, rep):
+            tail = read_log_tail(log_path)
+            detail = f"{mode} rep {rep} produced no measured step metrics; see {log_path}"
             if tail:
                 detail += f"\n--- torchrun.log tail ---\n{tail}"
             raise RuntimeError(detail)
