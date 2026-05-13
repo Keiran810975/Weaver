@@ -232,7 +232,7 @@ def mode_env(mode: str, rep: int, run_dir: Path, sock: Optional[Path], python: s
         env.setdefault("WEAVER_CUDA_EVENTS", "0")
         env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "0")
         env.setdefault("WEAVER_CUDA_EVENT_POOL", "1")
-        env.setdefault("WEAVER_PATCH_DLSYM", "1")
+        env["WEAVER_PATCH_DLSYM"] = "0"
         env.setdefault("WEAVER_PATCH_GETPROC", "1")
         env["WEAVER_TRACE_DIR"] = str(run_dir / "captured_kernels")
         env.setdefault("WEAVER_ENABLE_DISASM", "0")

@@ -154,6 +154,7 @@ static int g_cuda_event_pool_enabled = 1;
 static int g_trace_getproc_errors = 0;
 static int g_patch_dlsym = 0;
 static int g_patch_getproc = 1;
+static int g_disasm_enabled = 0;
 static unsigned long long g_launch_seq = 0;
 
 struct code_item {
@@ -325,8 +326,22 @@ static void* dlsym_next_any(const char* name, const char* alt_name) {
     return fn;
 }
 
+static void refresh_getproc_symbols(void) {
+    if (!real_cuGetProcAddress) {
+        real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress", NULL);
+        if (real_cuGetProcAddress == cuGetProcAddress) {
+            real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress");
+        }
+    }
+    if (!real_cuGetProcAddress_v2) {
+        real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress_v2", NULL);
+        if (real_cuGetProcAddress_v2 == cuGetProcAddress_v2) {
+            real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress_v2");
+        }
+    }
+}
+
 static void refresh_driver_symbols(void) {
-    ensure_libcuda_loaded();
     if (!real_cuModuleLoadData) {
         real_cuModuleLoadData = (cuModuleLoadData_t)dlsym_next_any("cuModuleLoadData", NULL);
         if (!real_cuModuleLoadData) {
@@ -444,22 +459,10 @@ static void refresh_driver_symbols(void) {
             real_cuEventDestroy = (cuEventDestroy_t)dlsym_libcuda("cuEventDestroy");
         }
     }
-    if (!real_cuGetProcAddress) {
-        real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress", NULL);
-        if (real_cuGetProcAddress == cuGetProcAddress) {
-            real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress");
-        }
-    }
-    if (!real_cuGetProcAddress_v2) {
-        real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress_v2", NULL);
-        if (real_cuGetProcAddress_v2 == cuGetProcAddress_v2) {
-            real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress_v2");
-        }
-    }
+    refresh_getproc_symbols();
 }
 
 static void refresh_runtime_symbols(void) {
-    ensure_libcudart_loaded();
     if (!real_cudaLaunchKernel) {
         real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)dlsym_next_any("cudaLaunchKernel", NULL);
         if (!real_cudaLaunchKernel) {
@@ -503,7 +506,6 @@ static void refresh_runtime_symbols(void) {
 }
 
 static void refresh_nccl_symbols(void) {
-    ensure_libnccl_loaded();
     if (!real_ncclAllReduce) {
         real_ncclAllReduce = (ncclAllReduce_t)dlsym_next_any("ncclAllReduce", NULL);
         if (!real_ncclAllReduce) {
@@ -826,7 +828,7 @@ static int write_kernel_binary_once(CUfunction func, const char* kernel_name,
 }
 
 static void launch_disassembler(CUfunction func, const char* kernel_name) {
-    if (!env_flag("WEAVER_ENABLE_DISASM", 0)) {
+    if (!g_disasm_enabled) {
         return;
     }
 
@@ -1127,9 +1129,12 @@ static void init_runtime(void) {
     g_sync_stream_anchor = env_flag("WEAVER_CUDA_SYNC_ANCHOR", 0);
     g_cuda_event_pool_enabled = env_flag("WEAVER_CUDA_EVENT_POOL", 1);
     g_trace_getproc_errors = env_flag("WEAVER_TRACE_GETPROC_ERRORS", 0);
-    g_patch_dlsym = env_flag("WEAVER_PATCH_DLSYM", 1);
+    g_patch_dlsym = env_flag("WEAVER_PATCH_DLSYM", 0);
     g_patch_getproc = env_flag("WEAVER_PATCH_GETPROC", 1);
-    signal(SIGCHLD, SIG_IGN);
+    g_disasm_enabled = env_flag("WEAVER_ENABLE_DISASM", 0);
+    if (g_disasm_enabled) {
+        signal(SIGCHLD, SIG_IGN);
+    }
 
     const char* sock = getenv("WEAVER_SOCK");
     if (!sock || !sock[0]) {
@@ -1148,12 +1153,15 @@ static void init_runtime(void) {
     }
 
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
         now_ns(), getpid(), (unsigned long long)pthread_self(),
         (g_cuda_event_enabled && real_cuEventCreate && real_cuEventRecord &&
          real_cuEventQuery && real_cuEventElapsedTime) ? "true" : "false",
         g_sync_stream_anchor ? "true" : "false",
         g_cuda_event_pool_enabled ? "true" : "false",
+        g_patch_dlsym ? "true" : "false",
+        g_patch_getproc ? "true" : "false",
+        g_disasm_enabled ? "true" : "false",
         real_cuLaunchKernel ? "true" : "false",
         real_cudaLaunchKernel ? "true" : "false",
         real_cuGetProcAddress ? "true" : "false",
@@ -1999,8 +2007,10 @@ static CUresult call_real_cu_get_proc_address(cuGetProcAddress_t getter,
                                               uint64_t flags,
                                               void* symbolStatus) {
     if (!getter) {
-        ensure_libcuda_loaded();
-        refresh_driver_symbols();
+        refresh_getproc_symbols();
+        getter = real_cuGetProcAddress ? real_cuGetProcAddress : real_cuGetProcAddress_v2;
+    }
+    if (!getter) {
         void* fn = dlsym_next_any(symbol, NULL);
         if (!fn) {
             fn = dlsym_libcuda(symbol);
@@ -2030,7 +2040,7 @@ CUresult cuGetProcAddress(const char* symbol,
                           uint64_t flags,
                           void* symbolStatus) {
     init_once();
-    refresh_driver_symbols();
+    refresh_getproc_symbols();
     cuGetProcAddress_t getter = real_cuGetProcAddress ? real_cuGetProcAddress : real_cuGetProcAddress_v2;
     if (!g_patch_getproc) {
         if (!getter || getter == cuGetProcAddress || getter == cuGetProcAddress_v2) {
@@ -2047,7 +2057,7 @@ CUresult cuGetProcAddress_v2(const char* symbol,
                              uint64_t flags,
                              void* symbolStatus) {
     init_once();
-    refresh_driver_symbols();
+    refresh_getproc_symbols();
     cuGetProcAddress_t getter = real_cuGetProcAddress_v2 ? real_cuGetProcAddress_v2 : real_cuGetProcAddress;
     if (!g_patch_getproc) {
         if (!getter || getter == cuGetProcAddress || getter == cuGetProcAddress_v2) {

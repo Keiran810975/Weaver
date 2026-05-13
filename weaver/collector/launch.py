@@ -80,7 +80,7 @@ def _target_env(args) -> dict:
     )
     env.setdefault("WEAVER_CUDA_EVENTS", "0")
     env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "0")
-    env.setdefault("WEAVER_PATCH_DLSYM", "1")
+    env.setdefault("WEAVER_PATCH_DLSYM", "0")
     env.setdefault("WEAVER_PATCH_GETPROC", "1")
     env.setdefault("WEAVER_ENABLE_DISASM", "0")
     env.setdefault("WEAVER_TRACE_DIR", str(Path(args.out).resolve().parent))
