@@ -37,9 +37,9 @@ Useful environment knobs:
 - `WEAVER_PYTHON_EVENT_BUDGET`: stop and unload the CPython profile callback after N emitted Python events. The low-overhead launcher defaults to `1`; use `0` for an unlimited/full Python trace during deep diagnosis.
 - `WEAVER_TRACE_GC=0/1`: disable or enable Python GC pause events.
 - `WEAVER_ENABLE_DISASM=1`: opt into loaded GPU code capture and the Neutrino-style disassembly sidecar. Default is `0` for the low-overhead normal path.
-- `WEAVER_CUDA_EVENTS=1`: opt into CUDA Event start/stop records and the background poller. Default is `0`; normal collection records CPU enqueue time plus launch metadata.
+- `WEAVER_CUDA_EVENTS=1`: collect CUDA Event start/stop records with the background poller. Default is `1`, so normal kernel events include measured GPU start/end.
 - `WEAVER_CUDA_EVENT_POOL=1`: reuse CUDA Event pairs across launches to avoid per-launch create/destroy overhead.
-- `WEAVER_CUDA_SYNC_ANCHOR=1`: optionally synchronize a per-stream anchor to align CUDA Event times onto host time more tightly.
+- `WEAVER_CUDA_SYNC_ANCHOR=1`: synchronize a per-stream anchor to align CUDA Event times onto host time. Default is `1`.
 
 For manual deep diagnosis, `weaver.collector.py_runtime.python_trace_window()` can
 temporarily resume the Python collector around a suspected region and pause it

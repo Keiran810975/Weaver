@@ -78,8 +78,8 @@ def _target_env(args) -> dict:
             ]
         ),
     )
-    env.setdefault("WEAVER_CUDA_EVENTS", "0")
-    env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "0")
+    env.setdefault("WEAVER_CUDA_EVENTS", "1")
+    env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
     env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", "1")
     env.setdefault("WEAVER_EMIT_CODE_EVENTS", "0")
     env.setdefault("WEAVER_ASYNC_LAUNCH_EMIT", "1")

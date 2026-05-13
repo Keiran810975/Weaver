@@ -245,8 +245,8 @@ def mode_env(
 
     if needs_hook(mode):
         add_preload(env, HOOK)
-        env.setdefault("WEAVER_CUDA_EVENTS", "0")
-        env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "0")
+        env.setdefault("WEAVER_CUDA_EVENTS", "1")
+        env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
         env.setdefault("WEAVER_CUDA_EVENT_POOL", "1")
         env.setdefault("WEAVER_EMIT_CODE_EVENTS", "0")
         env.setdefault("WEAVER_ASYNC_LAUNCH_EMIT", "1")
@@ -314,8 +314,17 @@ def count_weaver_events(path: Path) -> Dict[str, object]:
     layer = Counter()
     kind = Counter()
     total = 0
+    timed_kernel_launches = 0
+    stream_anchor_kernel_launches = 0
     if not path.exists():
-        return {"total": 0, "bytes": 0, "by_layer": {}, "by_kind": {}}
+        return {
+            "total": 0,
+            "bytes": 0,
+            "by_layer": {},
+            "by_kind": {},
+            "timed_kernel_launches": 0,
+            "stream_anchor_kernel_launches": 0,
+        }
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -328,11 +337,18 @@ def count_weaver_events(path: Path) -> Dict[str, object]:
             total += 1
             layer[str(event.get("layer", "unknown"))] += 1
             kind[str(event.get("kind", "unknown"))] += 1
+            payload = event.get("payload") or {}
+            if event.get("kind") == "kernel_launch" and payload.get("cuda_event_timing") is True:
+                timed_kernel_launches += 1
+                if payload.get("time_alignment") == "stream_anchor":
+                    stream_anchor_kernel_launches += 1
     return {
         "total": total,
         "bytes": path.stat().st_size,
         "by_layer": dict(layer),
         "by_kind": dict(kind),
+        "timed_kernel_launches": timed_kernel_launches,
+        "stream_anchor_kernel_launches": stream_anchor_kernel_launches,
     }
 
 
@@ -375,6 +391,15 @@ def validate_weaver_event_coverage(mode: str, events: Dict[str, object], log_pat
                 detail = (
                     f"{mode} produced no kernel_launch events; "
                     "ordinary CUDA kernel collection is incomplete"
+                )
+                if tail:
+                    detail += f"\n--- torchrun.log tail ---\n{tail}"
+                raise RuntimeError(detail)
+            if int(events.get("timed_kernel_launches", 0)) <= 0:
+                tail = read_log_tail(log_path)
+                detail = (
+                    f"{mode} produced no CUDA Event timed kernel_launch events; "
+                    "GPU start/end collection is incomplete"
                 )
                 if tail:
                     detail += f"\n--- torchrun.log tail ---\n{tail}"
@@ -459,6 +484,8 @@ def load_step_values(out_dir: Path, mode: str, field: str) -> List[float]:
 def load_event_counts(out_dir: Path, mode: str) -> Dict[str, object]:
     totals = []
     bytes_ = []
+    timed_kernel_launches = []
+    stream_anchor_kernel_launches = []
     layers = Counter()
     kinds = Counter()
     for path in sorted((out_dir / mode).glob("rep_*/run_result.json")):
@@ -466,11 +493,15 @@ def load_event_counts(out_dir: Path, mode: str) -> Dict[str, object]:
         ev = data.get("weaver_events", {})
         totals.append(int(ev.get("total", 0)))
         bytes_.append(int(ev.get("bytes", 0)))
+        timed_kernel_launches.append(int(ev.get("timed_kernel_launches", 0)))
+        stream_anchor_kernel_launches.append(int(ev.get("stream_anchor_kernel_launches", 0)))
         layers.update(ev.get("by_layer", {}))
         kinds.update(ev.get("by_kind", {}))
     return {
         "total_events": sum(totals),
         "total_bytes": sum(bytes_),
+        "timed_kernel_launches": sum(timed_kernel_launches),
+        "stream_anchor_kernel_launches": sum(stream_anchor_kernel_launches),
         "by_layer": dict(layers),
         "by_kind": dict(kinds),
     }
@@ -523,8 +554,8 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
         "method": {
             "preset": args.preset,
             "baseline": "same dual-GPU workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
-            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook in low-overhead CPU-enqueue mode",
-            "steady_state": "warmup iterations are excluded; CUDA Event timing and disassembly are disabled in the normal low-overhead path",
+            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook with asynchronous CUDA Event GPU timing",
+            "steady_state": "warmup iterations are excluded; CUDA Event timing is enabled for kernel GPU start/end, while disassembly is disabled in the normal path",
             "primary_metric": "median host_step_ms overhead vs baseline",
             "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes"],
         },
@@ -566,7 +597,7 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "",
         "Interpretation:",
         "- The main claim should use `weaver_full` host median overhead versus `baseline`.",
-        "- Default Weaver modes use the low-overhead CPU-enqueue CUDA hook; set `WEAVER_CUDA_EVENTS=1` only for deep timing diagnosis.",
+        "- Default Weaver modes use asynchronous CUDA Event timing for kernel GPU start/end.",
         "- `torch_profiler` is a reference diagnostic tool; the normal Weaver path should be below it.",
     ]
     path.write_text("\n".join(text), encoding="utf-8")

@@ -148,8 +148,8 @@ static pthread_cond_t g_queue_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_poller;
 static int g_poller_started = 0;
 static int g_should_run = 1;
-static int g_cuda_event_enabled = 0;
-static int g_sync_stream_anchor = 0;
+static int g_cuda_event_enabled = 1;
+static int g_sync_stream_anchor = 1;
 static int g_cuda_event_pool_enabled = 1;
 static int g_trace_getproc_errors = 0;
 static int g_patch_dlsym = 0;
@@ -1293,6 +1293,40 @@ static void destroy_launch_item(struct launch_item* item) {
     free(item);
 }
 
+static int emit_ready_launch_item(struct launch_item* item) {
+    if (!item || !real_cuEventQuery || real_cuEventQuery(item->end_event) != CU_SUCCESS) {
+        return 0;
+    }
+
+    float elapsed_ms = 0.0f;
+    long long ready_ns = now_ns();
+    long long dur_ns = 0;
+    if (real_cuEventElapsedTime &&
+        real_cuEventElapsedTime(&elapsed_ms, item->start_event, item->end_event) == CU_SUCCESS) {
+        dur_ns = (long long)(elapsed_ms * 1000000.0f);
+    }
+    if (dur_ns <= 0) {
+        dur_ns = item->cpu_enqueue_end_ns - item->cpu_enqueue_start_ns;
+    }
+
+    long long gpu_start_ns = ready_ns - dur_ns;
+    long long gpu_end_ns = ready_ns;
+    const char* alignment = "poll_ready_anchor";
+    if (item->anchor && item->anchor->valid && real_cuEventElapsedTime) {
+        float start_ms = 0.0f;
+        float end_ms = 0.0f;
+        if (real_cuEventElapsedTime(&start_ms, item->anchor->event, item->start_event) == CU_SUCCESS &&
+            real_cuEventElapsedTime(&end_ms, item->anchor->event, item->end_event) == CU_SUCCESS) {
+            gpu_start_ns = item->anchor->host_ns + (long long)(start_ms * 1000000.0f);
+            gpu_end_ns = item->anchor->host_ns + (long long)(end_ms * 1000000.0f);
+            alignment = "stream_anchor";
+        }
+    }
+
+    emit_kernel_launch(item, ready_ns, dur_ns, gpu_start_ns, gpu_end_ns, alignment, 1);
+    return 1;
+}
+
 static void queue_launch_item(struct launch_item* item) {
     pthread_mutex_lock(&g_queue_lock);
     item->next = g_pending;
@@ -1319,41 +1353,13 @@ static void* poller_run(void* unused) {
         struct launch_item** curp = &g_pending;
         while (*curp) {
             struct launch_item* item = *curp;
-            CUresult q = real_cuEventQuery ? real_cuEventQuery(item->end_event) : 1;
-            if (q != CU_SUCCESS) {
+            if (!emit_ready_launch_item(item)) {
                 curp = &((*curp)->next);
                 continue;
             }
 
             *curp = item->next;
             pthread_mutex_unlock(&g_queue_lock);
-
-            float elapsed_ms = 0.0f;
-            long long ready_ns = now_ns();
-            long long dur_ns = 0;
-            if (real_cuEventElapsedTime &&
-                real_cuEventElapsedTime(&elapsed_ms, item->start_event, item->end_event) == CU_SUCCESS) {
-                dur_ns = (long long)(elapsed_ms * 1000000.0f);
-            }
-            if (dur_ns <= 0) {
-                dur_ns = item->cpu_enqueue_end_ns - item->cpu_enqueue_start_ns;
-            }
-
-            long long gpu_start_ns = ready_ns - dur_ns;
-            long long gpu_end_ns = ready_ns;
-            const char* alignment = "poll_ready_anchor";
-            if (item->anchor && item->anchor->valid && real_cuEventElapsedTime) {
-                float start_ms = 0.0f;
-                float end_ms = 0.0f;
-                if (real_cuEventElapsedTime(&start_ms, item->anchor->event, item->start_event) == CU_SUCCESS &&
-                    real_cuEventElapsedTime(&end_ms, item->anchor->event, item->end_event) == CU_SUCCESS) {
-                    gpu_start_ns = item->anchor->host_ns + (long long)(start_ms * 1000000.0f);
-                    gpu_end_ns = item->anchor->host_ns + (long long)(end_ms * 1000000.0f);
-                    alignment = "stream_anchor";
-                }
-            }
-
-            emit_kernel_launch(item, ready_ns, dur_ns, gpu_start_ns, gpu_end_ns, alignment, 1);
             destroy_launch_item(item);
 
             pthread_mutex_lock(&g_queue_lock);
@@ -1368,6 +1374,12 @@ static void* poller_run(void* unused) {
     pthread_mutex_unlock(&g_queue_lock);
     while (item) {
         struct launch_item* next = item->next;
+        for (int i = 0; i < 100 && !emit_ready_launch_item(item); i++) {
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 1000000L;
+            nanosleep(&ts, NULL);
+        }
         destroy_launch_item(item);
         item = next;
     }
@@ -1384,8 +1396,8 @@ static int cuda_events_ready(void) {
 }
 
 static void init_runtime(void) {
-    g_cuda_event_enabled = env_flag("WEAVER_CUDA_EVENTS", 0);
-    g_sync_stream_anchor = env_flag("WEAVER_CUDA_SYNC_ANCHOR", 0);
+    g_cuda_event_enabled = env_flag("WEAVER_CUDA_EVENTS", 1);
+    g_sync_stream_anchor = env_flag("WEAVER_CUDA_SYNC_ANCHOR", 1);
     g_cuda_event_pool_enabled = env_flag("WEAVER_CUDA_EVENT_POOL", 1);
     g_trace_getproc_errors = env_flag("WEAVER_TRACE_GETPROC_ERRORS", 0);
     g_patch_dlsym = env_flag("WEAVER_PATCH_DLSYM", 0);
@@ -1672,11 +1684,11 @@ static CUresult handle_launch(CUfunction f,
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    struct event_pair* event_pair = begin_event_timing(hStream, &start_event, &end_event);
-    int use_events = event_pair != NULL;
-    if (use_events) {
+    if (cuda_events_ready()) {
         anchor = get_stream_anchor(hStream);
     }
+    struct event_pair* event_pair = begin_event_timing(hStream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
 
     long long cpu_start = now_ns();
     CUresult ret = launcher(f, gridDimX, gridDimY, gridDimZ,
@@ -1806,11 +1818,11 @@ static CUresult handle_launch_ex(const CUlaunchConfig* config,
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    struct event_pair* event_pair = begin_event_timing(config->hStream, &start_event, &end_event);
-    int use_events = event_pair != NULL;
-    if (use_events) {
+    if (cuda_events_ready()) {
         anchor = get_stream_anchor(config->hStream);
     }
+    struct event_pair* event_pair = begin_event_timing(config->hStream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
 
     long long cpu_start = now_ns();
     CUresult ret = launcher(config, f, kernelParams, extra);
@@ -1909,11 +1921,11 @@ static cudaError_t handle_runtime_launch(const void* func,
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    struct event_pair* event_pair = begin_event_timing((CUstream)stream, &start_event, &end_event);
-    int use_events = event_pair != NULL;
-    if (use_events) {
+    if (cuda_events_ready()) {
         anchor = get_stream_anchor((CUstream)stream);
     }
+    struct event_pair* event_pair = begin_event_timing((CUstream)stream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
 
     long long cpu_start = now_ns();
     cudaError_t ret = launcher(func, gridDim, blockDim, args, sharedMem, stream);
@@ -2063,11 +2075,11 @@ static cudaError_t handle_runtime_launch_ex(const cudaLaunchConfig_runtime* conf
     CUevent start_event = NULL;
     CUevent end_event = NULL;
     struct stream_anchor* anchor = NULL;
-    struct event_pair* event_pair = begin_event_timing((CUstream)config->stream, &start_event, &end_event);
-    int use_events = event_pair != NULL;
-    if (use_events) {
+    if (cuda_events_ready()) {
         anchor = get_stream_anchor((CUstream)config->stream);
     }
+    struct event_pair* event_pair = begin_event_timing((CUstream)config->stream, &start_event, &end_event);
+    int use_events = event_pair != NULL;
 
     long long cpu_start = now_ns();
     cudaError_t ret = launcher(config, func, args);

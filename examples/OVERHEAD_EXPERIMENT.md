@@ -3,7 +3,7 @@
 This experiment measures the steady-state cost of Weaver's three-layer collector:
 
 1. Native CPython `PyEval_SetProfile` operator collection with code-object address matching.
-2. LD_PRELOAD CUDA/NCCL launch interception in the low-overhead CPU-enqueue path.
+2. LD_PRELOAD CUDA/NCCL launch interception with asynchronous CUDA Event GPU timing.
 3. Warp/block launch metadata derived online from grid/block geometry.
 
 ## Core Idea
@@ -11,7 +11,7 @@ This experiment measures the steady-state cost of Weaver's three-layer collector
 Run the exact same dual-GPU DDP training workload under several modes:
 
 - `baseline`: no daemon, no CPython profile hook, no LD_PRELOAD hook.
-- `weaver_full`: daemon + native CPython hook + CUDA/NCCL hook with CPU enqueue timing and launch metadata.
+- `weaver_full`: daemon + native CPython hook + CUDA/NCCL hook with CUDA Event GPU start/end timing and launch metadata.
 - `weaver_no_disasm`: compatibility mode; normal collection already disables the disassembly sidecar.
 - `torch_profiler`: PyTorch profiler reference mode.
 
@@ -21,7 +21,7 @@ The primary metric is median per-step host wall time after warmup:
 overhead_pct = (median_step_ms(mode) - median_step_ms(baseline)) / median_step_ms(baseline) * 100
 ```
 
-GPU step time, p95 step time, event count, and emitted event bytes are secondary metrics. CUDA Event per-kernel timing is a deep-diagnosis option (`WEAVER_CUDA_EVENTS=1`) and is intentionally disabled in the normal low-overhead path.
+GPU step time, p95 step time, event count, and emitted event bytes are secondary metrics. CUDA Event per-kernel timing is enabled in the normal path so Weaver records measured GPU start/end; launch records are emitted asynchronously to keep the enqueue path lightweight.
 
 By default the Weaver Python layer uses the native C collector in a short burst:
 it samples matched operator calls with `--python-sample-rate 1`, emits one Python
@@ -115,4 +115,4 @@ Use `weaver_full` versus `baseline` as the main result. A good low-overhead clai
 - event MB per step;
 - whether `weaver_full` is below the optional `torch_profiler` reference.
 
-Use `torch_profiler` only as a familiar reference point. The normal Weaver path should be no slower than this reference; if `WEAVER_CUDA_EVENTS=1` is enabled, report it separately as deep timing diagnosis rather than the low-overhead result.
+Use `torch_profiler` only as a familiar reference point. The normal Weaver path should be no slower than this reference while still reporting CUDA Event timed kernel start/end.
