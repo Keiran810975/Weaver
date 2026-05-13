@@ -155,6 +155,7 @@ static int g_trace_getproc_errors = 0;
 static int g_patch_dlsym = 0;
 static int g_patch_getproc = 1;
 static int g_disasm_enabled = 0;
+static int g_emit_code_events = 0;
 static unsigned long long g_launch_seq = 0;
 
 struct code_item {
@@ -227,6 +228,10 @@ static dlsym_fn_t real_dlsym_func = NULL;
 static void* g_libcuda_handle = NULL;
 static void* g_libcudart_handle = NULL;
 static void* g_libnccl_handle = NULL;
+static int g_getproc_symbols_refreshed = 0;
+static int g_driver_symbols_refreshed = 0;
+static int g_runtime_symbols_refreshed = 0;
+static int g_nccl_symbols_refreshed = 0;
 
 static dlsym_fn_t get_real_dlsym(void) {
 #ifdef __linux__
@@ -378,6 +383,9 @@ static int is_blocked_interposer_caller(void* caller) {
 }
 
 static void refresh_getproc_symbols(void) {
+    if (g_getproc_symbols_refreshed) {
+        return;
+    }
     if (!real_cuGetProcAddress) {
         real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress", NULL);
         if (real_cuGetProcAddress == cuGetProcAddress) {
@@ -390,9 +398,13 @@ static void refresh_getproc_symbols(void) {
             real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress_v2");
         }
     }
+    g_getproc_symbols_refreshed = 1;
 }
 
 static void refresh_driver_symbols(void) {
+    if (g_driver_symbols_refreshed) {
+        return;
+    }
     if (!real_cuModuleLoadData) {
         real_cuModuleLoadData = (cuModuleLoadData_t)dlsym_next_any("cuModuleLoadData", NULL);
         if (!real_cuModuleLoadData) {
@@ -511,9 +523,13 @@ static void refresh_driver_symbols(void) {
         }
     }
     refresh_getproc_symbols();
+    g_driver_symbols_refreshed = 1;
 }
 
 static void refresh_runtime_symbols(void) {
+    if (g_runtime_symbols_refreshed) {
+        return;
+    }
     if (!real_cudaLaunchKernel) {
         real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)dlsym_next_any("cudaLaunchKernel", NULL);
         if (!real_cudaLaunchKernel) {
@@ -554,9 +570,13 @@ static void refresh_runtime_symbols(void) {
                 (cudaLaunchCooperativeKernel_t)dlsym_libcudart("cudaLaunchCooperativeKernel_ptsz");
         }
     }
+    g_runtime_symbols_refreshed = 1;
 }
 
 static void refresh_nccl_symbols(void) {
+    if (g_nccl_symbols_refreshed) {
+        return;
+    }
     if (!real_ncclAllReduce) {
         real_ncclAllReduce = (ncclAllReduce_t)dlsym_next_any("ncclAllReduce", NULL);
         if (!real_ncclAllReduce) {
@@ -581,6 +601,7 @@ static void refresh_nccl_symbols(void) {
             real_ncclBroadcast = (ncclBroadcast_t)dlsym_libnccl("ncclBroadcast");
         }
     }
+    g_nccl_symbols_refreshed = 1;
 }
 
 static void json_escape(const char* in, char* out, size_t out_size) {
@@ -1183,6 +1204,7 @@ static void init_runtime(void) {
     g_patch_dlsym = env_flag("WEAVER_PATCH_DLSYM", 0);
     g_patch_getproc = env_flag("WEAVER_PATCH_GETPROC", 1);
     g_disasm_enabled = env_flag("WEAVER_ENABLE_DISASM", 0);
+    g_emit_code_events = env_flag("WEAVER_EMIT_CODE_EVENTS", 0);
     if (g_disasm_enabled) {
         signal(SIGCHLD, SIG_IGN);
     }
@@ -1204,7 +1226,7 @@ static void init_runtime(void) {
     }
 
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
         now_ns(), getpid(), (unsigned long long)pthread_self(),
         (g_cuda_event_enabled && real_cuEventCreate && real_cuEventRecord &&
          real_cuEventQuery && real_cuEventElapsedTime) ? "true" : "false",
@@ -1213,6 +1235,7 @@ static void init_runtime(void) {
         g_patch_dlsym ? "true" : "false",
         g_patch_getproc ? "true" : "false",
         g_disasm_enabled ? "true" : "false",
+        g_emit_code_events ? "true" : "false",
         real_cuLaunchKernel ? "true" : "false",
         real_cudaLaunchKernel ? "true" : "false",
         real_cuGetProcAddress ? "true" : "false",
@@ -1254,9 +1277,11 @@ CUresult cuModuleLoadData(CUmodule* module, const void* image) {
             code_set(*module, code, size, NULL);
         }
     }
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_load_data\",\"payload\":{\"ret\":%d,\"module\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), ret, module ? *module : NULL);
+    if (g_emit_code_events) {
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_load_data\",\"payload\":{\"ret\":%d,\"module\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), ret, module ? *module : NULL);
+    }
     return ret;
 }
 
@@ -1275,9 +1300,11 @@ CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int nu
             code_set(*module, code, size, NULL);
         }
     }
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_load_data_ex\",\"payload\":{\"ret\":%d,\"module\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), ret, module ? *module : NULL);
+    if (g_emit_code_events) {
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_load_data_ex\",\"payload\":{\"ret\":%d,\"module\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), ret, module ? *module : NULL);
+    }
     return ret;
 }
 
@@ -1295,9 +1322,11 @@ CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin) {
             code_set(*module, code, size, NULL);
         }
     }
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_load_fat_binary\",\"payload\":{\"ret\":%d,\"module\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), ret, module ? *module : NULL);
+    if (g_emit_code_events) {
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_load_fat_binary\",\"payload\":{\"ret\":%d,\"module\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), ret, module ? *module : NULL);
+    }
     return ret;
 }
 
@@ -1320,9 +1349,11 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, void* jitOption
             code_set(*library, managed, size, NULL);
         }
     }
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"library_load_data\",\"payload\":{\"ret\":%d,\"library\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), ret, library ? *library : NULL);
+    if (g_emit_code_events) {
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"library_load_data\",\"payload\":{\"ret\":%d,\"library\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), ret, library ? *library : NULL);
+    }
     return ret;
 }
 
@@ -1336,12 +1367,14 @@ CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name)
     if (ret == CU_SUCCESS && hfunc && *hfunc) {
         code_copy_key(hmod, *hfunc, name);
     }
-    char escaped[1024];
-    json_escape(name ? name : "", escaped, sizeof(escaped));
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_get_function\",\"kernel_name\":\"%s\",\"payload\":{\"ret\":%d,\"name\":\"%s\",\"func\":\"%p\",\"module\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
-        ret, escaped, hfunc ? *hfunc : NULL, hmod);
+    if (g_emit_code_events) {
+        char escaped[1024];
+        json_escape(name ? name : "", escaped, sizeof(escaped));
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"module_get_function\",\"kernel_name\":\"%s\",\"payload\":{\"ret\":%d,\"name\":\"%s\",\"func\":\"%p\",\"module\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
+            ret, escaped, hfunc ? *hfunc : NULL, hmod);
+    }
     return ret;
 }
 
@@ -1355,12 +1388,14 @@ CUresult cuLibraryGetKernel(CUkernel* pKernel, CUlibrary library, const char* na
     if (ret == CU_SUCCESS && pKernel && *pKernel) {
         code_copy_key(library, *pKernel, name);
     }
-    char escaped[1024];
-    json_escape(name ? name : "", escaped, sizeof(escaped));
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"library_get_kernel\",\"kernel_name\":\"%s\",\"payload\":{\"ret\":%d,\"name\":\"%s\",\"kernel\":\"%p\",\"library\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
-        ret, escaped, pKernel ? *pKernel : NULL, library);
+    if (g_emit_code_events) {
+        char escaped[1024];
+        json_escape(name ? name : "", escaped, sizeof(escaped));
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"library_get_kernel\",\"kernel_name\":\"%s\",\"payload\":{\"ret\":%d,\"name\":\"%s\",\"kernel\":\"%p\",\"library\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
+            ret, escaped, pKernel ? *pKernel : NULL, library);
+    }
     return ret;
 }
 
@@ -1374,9 +1409,11 @@ CUresult cuKernelGetFunction(CUfunction* pFunc, CUkernel kernel) {
     if (ret == CU_SUCCESS && pFunc && *pFunc) {
         code_copy_key(kernel, *pFunc, NULL);
     }
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_get_function\",\"payload\":{\"ret\":%d,\"kernel\":\"%p\",\"func\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), ret, kernel, pFunc ? *pFunc : NULL);
+    if (g_emit_code_events) {
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_get_function\",\"payload\":{\"ret\":%d,\"kernel\":\"%p\",\"func\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), ret, kernel, pFunc ? *pFunc : NULL);
+    }
     return ret;
 }
 
@@ -1390,9 +1427,11 @@ CUresult cuLibraryGetModule(CUmodule* pMod, CUlibrary library) {
     if (ret == CU_SUCCESS && pMod && *pMod) {
         code_copy_key(library, *pMod, NULL);
     }
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"library_get_module\",\"payload\":{\"ret\":%d,\"module\":\"%p\",\"library\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), ret, pMod ? *pMod : NULL, library);
+    if (g_emit_code_events) {
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"library_get_module\",\"payload\":{\"ret\":%d,\"module\":\"%p\",\"library\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), ret, pMod ? *pMod : NULL, library);
+    }
     return ret;
 }
 
@@ -1406,12 +1445,14 @@ CUresult cuFuncGetName(const char** name, CUfunction hfunc) {
     if (ret == CU_SUCCESS && name && *name) {
         code_set_name(hfunc, *name);
     }
-    char escaped[1024];
-    json_escape((name && *name) ? *name : "", escaped, sizeof(escaped));
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"func_get_name\",\"kernel_name\":\"%s\",\"payload\":{\"ret\":%d,\"name\":\"%s\",\"func\":\"%p\"}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
-        ret, escaped, hfunc);
+    if (g_emit_code_events) {
+        char escaped[1024];
+        json_escape((name && *name) ? *name : "", escaped, sizeof(escaped));
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"func_get_name\",\"kernel_name\":\"%s\",\"payload\":{\"ret\":%d,\"name\":\"%s\",\"func\":\"%p\"}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
+            ret, escaped, hfunc);
+    }
     return ret;
 }
 

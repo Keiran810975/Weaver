@@ -81,6 +81,7 @@ def _target_env(args) -> dict:
     env.setdefault("WEAVER_CUDA_EVENTS", "0")
     env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "0")
     env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", "1")
+    env.setdefault("WEAVER_EMIT_CODE_EVENTS", "0")
     env.setdefault("WEAVER_PATCH_DLSYM", "0")
     env.setdefault("WEAVER_PATCH_GETPROC", "1")
     env.setdefault("WEAVER_ENABLE_DISASM", "0")
