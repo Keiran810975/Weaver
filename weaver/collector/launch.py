@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -6,6 +7,25 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Optional
+
+
+FAMILY_KERNEL_PATTERNS = {
+    "GEMM": [
+        "gemm",
+        "sgemm",
+        "dgemm",
+        "hgemm",
+        "matmul",
+        "cutlass",
+        "triton_gemm",
+        "triton_mm",
+        "cublas",
+    ],
+    "NCCL": ["nccl", "allreduce", "all_reduce", "allgather", "reducescatter"],
+    "MEMCPY": ["memcpy", "copy", "transpose", "permute", "contiguous"],
+    "MEMORY": ["memcpy", "copy", "transpose", "permute", "contiguous"],
+    "REDUCTION": ["reduce", "softmax", "norm", "layer_norm", "rms_norm"],
+}
 
 
 def _repo_root() -> Path:
@@ -25,6 +45,75 @@ def _prepend_preload(env: dict, hook: Path) -> None:
     key = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
     old = env.get(key)
     env[key] = str(hook) if not old else f"{hook}:{old}"
+
+
+def _append_patterns(patterns: List[str], value, prefix: str = "") -> None:
+    if not value:
+        return
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        return
+    for item in values:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            patterns.append(f"{prefix}{text}" if prefix else text)
+
+
+def _append_family_patterns(patterns: List[str], family) -> None:
+    if not family:
+        return
+    if isinstance(family, str):
+        families = [family]
+    elif isinstance(family, (list, tuple)):
+        families = family
+    else:
+        return
+    for item in families:
+        key = str(item).strip().upper()
+        for pattern in FAMILY_KERNEL_PATTERNS.get(key, []):
+            patterns.append(pattern)
+
+
+def _expected_patterns_from_sketch(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    sketch_path = Path(path).expanduser().resolve()
+    data = json.loads(sketch_path.read_text(encoding="utf-8"))
+    patterns: List[str] = []
+
+    for scope in (data, data.get("metadata") or {}):
+        _append_patterns(patterns, scope.get("expected_kernel_names"), "exact:")
+        _append_patterns(patterns, scope.get("expected_kernel_patterns"))
+        _append_patterns(patterns, scope.get("expected_kernel_regexes"), "regex:")
+
+    for template in data.get("kernel_templates", []) or []:
+        match = template.get("match") or {}
+        _append_patterns(patterns, match.get("kernel_name"), "exact:")
+        _append_patterns(patterns, match.get("kernel_names"), "exact:")
+        _append_patterns(patterns, match.get("kernel_name_substr"))
+        _append_patterns(patterns, match.get("kernel_name_contains"))
+        _append_patterns(patterns, match.get("kernel_name_regex"), "regex:")
+        _append_patterns(patterns, match.get("name_regex"), "regex:")
+        _append_family_patterns(patterns, template.get("family"))
+
+    for dep in data.get("expected_dependencies", []) or data.get("dependency_expectations", []) or []:
+        _append_family_patterns(patterns, (dep.get("target") or {}).get("family"))
+        for pred in dep.get("predecessors") or []:
+            _append_family_patterns(patterns, pred.get("family"))
+
+    # Stable de-duplication keeps the environment compact.
+    seen = set()
+    deduped = []
+    for pattern in patterns:
+        if pattern not in seen:
+            seen.add(pattern)
+            deduped.append(pattern)
+    return deduped
 
 
 def _start_daemon(args) -> subprocess.Popen:
@@ -78,6 +167,14 @@ def _target_env(args) -> dict:
             ]
         ),
     )
+    env.setdefault("WEAVER_COLLECTION_MODE", args.collection_mode)
+    env.setdefault("WEAVER_TRIGGER_CAPTURE_AFTER", str(max(0, args.trigger_capture_after)))
+    patterns = []
+    patterns.extend(_expected_patterns_from_sketch(args.sketch))
+    if args.expected_kernels:
+        patterns.extend([p.strip() for p in args.expected_kernels.split(",") if p.strip()])
+    if patterns:
+        env["WEAVER_EXPECTED_KERNELS"] = ";".join(patterns)
     env.setdefault("WEAVER_CUDA_EVENTS", "1")
     env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
     env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", "1")
@@ -102,6 +199,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--http-port", type=int, default=18731)
     parser.add_argument("--out", default="./weaver_events.ndjson")
     parser.add_argument("--hook", default=str(_default_hook()))
+    parser.add_argument(
+        "--collection-mode",
+        choices=["adaptive_name", "name_only", "full"],
+        default=os.environ.get("WEAVER_COLLECTION_MODE", "adaptive_name"),
+        help="adaptive_name records expected kernels by name and times only triggered windows",
+    )
+    parser.add_argument(
+        "--sketch",
+        help="manual execution sketch used to derive expected kernel name patterns",
+    )
+    parser.add_argument(
+        "--expected-kernels",
+        help="comma-separated extra expected kernel patterns; use exact: or regex: prefixes when needed",
+    )
+    parser.add_argument(
+        "--trigger-capture-after",
+        type=int,
+        default=int(os.environ.get("WEAVER_TRIGGER_CAPTURE_AFTER", "2")),
+        help="number of launches after an unexpected kernel to capture with CUDA Event timing",
+    )
     parser.add_argument("--no-daemon", action="store_true", help="use an already running daemon")
     parser.add_argument("cmd", nargs=argparse.REMAINDER, help="target command after --")
     args = parser.parse_args(argv)
