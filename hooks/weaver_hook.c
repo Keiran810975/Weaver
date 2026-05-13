@@ -152,8 +152,8 @@ static int g_cuda_event_enabled = 0;
 static int g_sync_stream_anchor = 0;
 static int g_cuda_event_pool_enabled = 1;
 static int g_trace_getproc_errors = 0;
-static int g_patch_dlsym = 0;
-static int g_patch_getproc = 0;
+static int g_patch_dlsym = 1;
+static int g_patch_getproc = 1;
 static unsigned long long g_launch_seq = 0;
 
 struct code_item {
