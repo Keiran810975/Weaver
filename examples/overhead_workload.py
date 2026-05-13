@@ -309,6 +309,7 @@ def main() -> None:
         },
         "env": {
             "WEAVER_AUTO_PROFILE": os.environ.get("WEAVER_AUTO_PROFILE", ""),
+            "WEAVER_PYTHON_EVENT_BUDGET": os.environ.get("WEAVER_PYTHON_EVENT_BUDGET", ""),
             "WEAVER_CUDA_EVENTS": os.environ.get("WEAVER_CUDA_EVENTS", ""),
             "WEAVER_ENABLE_DISASM": os.environ.get("WEAVER_ENABLE_DISASM", ""),
             "WEAVER_CUDA_SYNC_ANCHOR": os.environ.get("WEAVER_CUDA_SYNC_ANCHOR", ""),

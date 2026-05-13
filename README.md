@@ -33,12 +33,17 @@ Useful environment knobs:
 - `WEAVER_PYTHON_TRACE_FUNCS`: comma-separated function filters, using the DLRover-style `module@object@function` form or plain function names.
 - `WEAVER_PYTHON_COLLECTOR=native`: use the Flare/DLRover-style native C profile callback; `python` keeps the older pure-Python fallback for debugging.
 - `WEAVER_REQUIRE_NATIVE_PY=1`: fail fast if the native collector was not built, instead of silently falling back.
-- `WEAVER_PYTHON_SAMPLE_RATE`: sample every N matched Python operator calls; keep `1` for a full Python trace.
+- `WEAVER_PYTHON_SAMPLE_RATE`: sample every N matched Python operator calls.
+- `WEAVER_PYTHON_EVENT_BUDGET`: stop and unload the CPython profile callback after N emitted Python events. The low-overhead launcher defaults to `1`; use `0` for an unlimited/full Python trace during deep diagnosis.
 - `WEAVER_TRACE_GC=0/1`: disable or enable Python GC pause events.
 - `WEAVER_ENABLE_DISASM=1`: opt into loaded GPU code capture and the Neutrino-style disassembly sidecar. Default is `0` for the low-overhead normal path.
 - `WEAVER_CUDA_EVENTS=1`: opt into CUDA Event start/stop records and the background poller. Default is `0`; normal collection records CPU enqueue time plus launch metadata.
 - `WEAVER_CUDA_EVENT_POOL=1`: reuse CUDA Event pairs across launches to avoid per-launch create/destroy overhead.
 - `WEAVER_CUDA_SYNC_ANCHOR=1`: optionally synchronize a per-stream anchor to align CUDA Event times onto host time more tightly.
+
+For manual deep diagnosis, `weaver.collector.py_runtime.python_trace_window()` can
+temporarily resume the Python collector around a suspected region and pause it
+again on exit.
 
 ## 3) Python layer collection
 

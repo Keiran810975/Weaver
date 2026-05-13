@@ -6,6 +6,7 @@ import socket
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import FrameType
 from typing import Dict, Optional, Tuple, Union
@@ -19,6 +20,7 @@ class PythonCollectorConfig:
     targets: Tuple[str, ...] = ()
     trace_gc: bool = True
     emit_raw_calls: bool = False
+    event_budget: int = 0
 
 
 class _Sender:
@@ -50,10 +52,12 @@ class PythonRuntimeCollector:
         self._sample_rate = max(1, int(self.cfg.sample_rate))
         self._targets = tuple(t.strip().replace("@", ".") for t in self.cfg.targets if t.strip())
         self._enabled = False
+        self._profile_active = False
         self._orig_profiler = None
         self._active: Dict[int, Tuple[int, str]] = {}
         self._match_cache: Dict[object, bool] = {}
         self._gc_callback = None
+        self._emitted_events = 0
 
     def _is_interesting(self, filename: str) -> bool:
         if self.cfg.include_stdlib:
@@ -146,8 +150,17 @@ class PythonRuntimeCollector:
                 },
             }
         )
+        self._after_operator_event()
+
+    def _after_operator_event(self):
+        self._emitted_events += 1
+        budget = max(0, int(self.cfg.event_budget))
+        if budget and self._emitted_events >= budget:
+            self.pause()
 
     def _hook(self, frame: FrameType, event: str, _arg):
+        if not self._profile_active:
+            return self._hook
         if event not in ("call", "return"):
             return self._hook
         if not self._matches_target(frame):
@@ -218,12 +231,14 @@ class PythonRuntimeCollector:
         sys.setprofile(self._hook)
         threading.setprofile(self._hook)
         self._enabled = True
+        self._profile_active = True
 
     def stop(self):
         if not self._enabled:
             return
         sys.setprofile(self._orig_profiler)
         threading.setprofile(self._orig_profiler)
+        self._profile_active = False
         if self._gc_callback is not None:
             try:
                 gc.callbacks.remove(self._gc_callback)
@@ -231,6 +246,20 @@ class PythonRuntimeCollector:
                 pass
             self._gc_callback = None
         self._enabled = False
+
+    def pause(self):
+        if not self._enabled or not self._profile_active:
+            return
+        sys.setprofile(self._orig_profiler)
+        threading.setprofile(self._orig_profiler)
+        self._profile_active = False
+
+    def resume(self):
+        if not self._enabled or self._profile_active:
+            return
+        sys.setprofile(self._hook)
+        threading.setprofile(self._hook)
+        self._profile_active = True
 
 
 class NativePythonRuntimeCollector:
@@ -254,11 +283,13 @@ class NativePythonRuntimeCollector:
         from . import _native_py_trace
 
         queue_size = max(1024, int(os.environ.get("WEAVER_NATIVE_PY_QUEUE_SIZE", "65536")))
+        event_budget = max(0, int(self.cfg.event_budget))
         _native_py_trace.start(
             sock_path=self.cfg.socket_path,
             targets=self.cfg.targets,
             sample_rate=max(1, int(self.cfg.sample_rate)),
             queue_size=queue_size,
+            event_budget=event_budget,
         )
         self._native = _native_py_trace
         self._enabled = True
@@ -269,6 +300,16 @@ class NativePythonRuntimeCollector:
         if self._native is not None:
             self._native.stop()
         self._enabled = False
+
+    def pause(self):
+        if not self._enabled or self._native is None:
+            return
+        self._native.pause()
+
+    def resume(self):
+        if not self._enabled or self._native is None:
+            return
+        self._native.resume()
 
 
 CollectorHandle = Union[PythonRuntimeCollector, NativePythonRuntimeCollector]
@@ -285,6 +326,7 @@ def enable_python_collector(
     trace_gc: bool = True,
     emit_raw_calls: bool = False,
     backend: Optional[str] = None,
+    event_budget: int = 0,
 ) -> CollectorHandle:
     global _global_collector
     if _global_collector is None:
@@ -295,6 +337,7 @@ def enable_python_collector(
             targets=targets,
             trace_gc=trace_gc,
             emit_raw_calls=emit_raw_calls,
+            event_budget=max(0, int(event_budget)),
         )
         selected = (backend or os.environ.get("WEAVER_PYTHON_COLLECTOR", "native")).lower()
         require_native = os.environ.get("WEAVER_REQUIRE_NATIVE_PY", "0") in ("1", "true", "TRUE", "on", "ON")
@@ -332,4 +375,25 @@ def enable_from_env() -> Optional[CollectorHandle]:
         trace_gc=os.environ.get("WEAVER_TRACE_GC", "1") not in ("0", "false", "FALSE"),
         emit_raw_calls=os.environ.get("WEAVER_PROFILE_RAW_CALLS", "0") in ("1", "true", "TRUE"),
         backend=os.environ.get("WEAVER_PYTHON_COLLECTOR", "native"),
+        event_budget=max(0, int(os.environ.get("WEAVER_PYTHON_EVENT_BUDGET", "0"))),
     )
+
+
+def pause_python_collector() -> None:
+    if _global_collector is not None and hasattr(_global_collector, "pause"):
+        _global_collector.pause()
+
+
+def resume_python_collector() -> None:
+    if _global_collector is not None and hasattr(_global_collector, "resume"):
+        _global_collector.resume()
+
+
+@contextmanager
+def python_trace_window():
+    """Temporarily arm the Python collector around a suspected region."""
+    resume_python_collector()
+    try:
+        yield
+    finally:
+        pause_python_collector()

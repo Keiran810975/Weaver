@@ -23,11 +23,13 @@ overhead_pct = (median_step_ms(mode) - median_step_ms(baseline)) / median_step_m
 
 GPU step time, p95 step time, event count, and emitted event bytes are secondary metrics. CUDA Event per-kernel timing is a deep-diagnosis option (`WEAVER_CUDA_EVENTS=1`) and is intentionally disabled in the normal low-overhead path.
 
-By default the Weaver Python layer uses the native C collector, samples every 10
-matched operator calls (`--python-sample-rate 10`), and disables GC events for
-this benchmark. Use `--python-sample-rate 1` when you want a full Python operator
-trace. The pure-Python collector is kept only as a debugging fallback because it
-is not the low-overhead Flare-style path.
+By default the Weaver Python layer uses the native C collector in a short burst:
+it samples matched operator calls with `--python-sample-rate 1`, emits one Python
+operator anchor per rank (`--python-event-budget 1`), then unloads the CPython
+profile callback. This keeps the normal path from paying profile-hook cost during
+steady-state training. Use `--python-event-budget 0` when you want an unlimited
+Python operator trace for deep diagnosis. The pure-Python collector is kept only
+as a debugging fallback because it is not the low-overhead Flare-style path.
 
 ## Workload
 
@@ -71,7 +73,8 @@ dim = 512
 hidden_dim = 2048
 layers = 3
 explicit_comm_mb = 16
-python_sample_rate = 10
+python_sample_rate = 1
+python_event_budget = 1
 ```
 
 For an ablation that separates Python collection from the CUDA/NCCL hook:

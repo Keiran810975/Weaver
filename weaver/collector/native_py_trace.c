@@ -63,10 +63,15 @@ static pthread_t g_flush_thread;
 static int g_flush_started = 0;
 static int g_stop_flush = 0;
 static int g_running = 0;
+static int g_profile_active = 0;
 static unsigned long g_sample_rate = 1;
+static unsigned long g_event_budget = 0;
+static unsigned long g_emitted_events = 0;
 
 static int g_sock = -1;
 static struct sockaddr_un g_addr;
+
+static void set_profile_for_threads(Py_tracefunc tracefunc);
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -248,6 +253,21 @@ static void queue_event(const TraceEvent* event) {
     pthread_mutex_unlock(&g_queue_lock);
 }
 
+static void deactivate_profile(void) {
+    if (!g_profile_active) {
+        return;
+    }
+    g_profile_active = 0;
+    set_profile_for_threads(NULL);
+}
+
+static void after_operator_event(void) {
+    g_emitted_events++;
+    if (g_event_budget > 0 && g_emitted_events >= g_event_budget) {
+        deactivate_profile();
+    }
+}
+
 static void json_escape(const char* in, char* out, size_t out_size) {
     if (out_size == 0) {
         return;
@@ -317,7 +337,7 @@ static void* flush_loop(void* unused) {
 static int profiler(PyObject* obj, PyFrameObject* frame, int what, PyObject* arg) {
     (void)obj;
     (void)arg;
-    if (!g_running || !frame) {
+    if (!g_running || !g_profile_active || !frame) {
         return 0;
     }
 
@@ -336,6 +356,7 @@ static int profiler(PyObject* obj, PyFrameObject* frame, int what, PyObject* arg
         event.target = target;
         event.dropped_snapshot = g_dropped;
         queue_event(&event);
+        after_operator_event();
         return 0;
     }
     if (what != PyTrace_CALL) {
@@ -445,6 +466,7 @@ static void reset_state(void) {
     g_queue_tail = 0;
     g_queue_count = 0;
     g_dropped = 0;
+    g_emitted_events = 0;
 }
 
 static PyObject* native_start(PyObject* self, PyObject* args, PyObject* kwargs) {
@@ -453,15 +475,17 @@ static PyObject* native_start(PyObject* self, PyObject* args, PyObject* kwargs) 
     PyObject* targets = NULL;
     long sample_rate = 1;
     unsigned long queue_size = DEFAULT_QUEUE_SIZE;
-    static char* kwlist[] = {"sock_path", "targets", "sample_rate", "queue_size", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "sO|lk", kwlist,
-                                     &sock_path, &targets, &sample_rate, &queue_size)) {
+    unsigned long event_budget = 0;
+    static char* kwlist[] = {"sock_path", "targets", "sample_rate", "queue_size", "event_budget", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "sO|lkk", kwlist,
+                                     &sock_path, &targets, &sample_rate, &queue_size, &event_budget)) {
         return NULL;
     }
     if (sample_rate < 1) {
         sample_rate = 1;
     }
     g_sample_rate = (unsigned long)sample_rate;
+    g_event_budget = event_budget;
     if (queue_size < 1024U) {
         queue_size = 1024U;
     }
@@ -500,6 +524,7 @@ static PyObject* native_start(PyObject* self, PyObject* args, PyObject* kwargs) 
     }
 
     g_running = 1;
+    g_profile_active = 1;
     set_profile_for_threads(profiler);
     Py_RETURN_NONE;
 }
@@ -510,6 +535,7 @@ static PyObject* native_stop(PyObject* self, PyObject* Py_UNUSED(ignored)) {
         Py_RETURN_NONE;
     }
     set_profile_for_threads(NULL);
+    g_profile_active = 0;
     g_running = 0;
 
     pthread_mutex_lock(&g_queue_lock);
@@ -534,10 +560,31 @@ static PyObject* native_stop(PyObject* self, PyObject* Py_UNUSED(ignored)) {
 
 static PyObject* native_stats(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     (void)self;
-    return Py_BuildValue("{s:i,s:K,s:n}",
+    return Py_BuildValue("{s:i,s:i,s:k,s:k,s:K,s:n}",
                          "running", g_running,
+                         "profile_active", g_profile_active,
+                         "event_budget", g_event_budget,
+                         "emitted_events", g_emitted_events,
                          "dropped", (unsigned long long)g_dropped,
                          "queued", (Py_ssize_t)g_queue_count);
+}
+
+static PyObject* native_pause(PyObject* self, PyObject* Py_UNUSED(ignored)) {
+    (void)self;
+    if (g_running) {
+        deactivate_profile();
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* native_resume(PyObject* self, PyObject* Py_UNUSED(ignored)) {
+    (void)self;
+    if (!g_running || g_profile_active) {
+        Py_RETURN_NONE;
+    }
+    g_profile_active = 1;
+    set_profile_for_threads(profiler);
+    Py_RETURN_NONE;
 }
 
 #if defined(__clang__)
@@ -547,6 +594,8 @@ static PyObject* native_stats(PyObject* self, PyObject* Py_UNUSED(ignored)) {
 static PyMethodDef Methods[] = {
     {"start", (PyCFunction)native_start, METH_VARARGS | METH_KEYWORDS, "Start native low-overhead Python tracing."},
     {"stop", native_stop, METH_NOARGS, "Stop native Python tracing."},
+    {"pause", native_pause, METH_NOARGS, "Pause native Python tracing without stopping the flush thread."},
+    {"resume", native_resume, METH_NOARGS, "Resume native Python tracing."},
     {"stats", native_stats, METH_NOARGS, "Return native tracing stats."},
     {NULL, NULL, 0, NULL},
 };
