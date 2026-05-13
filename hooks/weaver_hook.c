@@ -156,6 +156,7 @@ static int g_patch_dlsym = 0;
 static int g_patch_getproc = 1;
 static int g_disasm_enabled = 0;
 static int g_emit_code_events = 0;
+static int g_async_launch_emit = 1;
 static unsigned long long g_launch_seq = 0;
 
 struct code_item {
@@ -202,10 +203,44 @@ struct event_pair {
     struct event_pair* next;
 };
 
+struct launch_emit_record {
+    long long ts_ns;
+    int pid;
+    unsigned long long tid;
+    char kernel_name[256];
+    char alignment[64];
+    long long gpu_start_ns;
+    long long gpu_end_ns;
+    long long gpu_duration_ns;
+    long long cpu_enqueue_start_ns;
+    long long cpu_enqueue_end_ns;
+    long long poll_ready_ns;
+    void* func;
+    void* stream;
+    unsigned long long launch_id;
+    int ret;
+    unsigned int grid[3];
+    unsigned int block[3];
+    unsigned int shared_mem;
+    unsigned long long warps_per_block;
+    unsigned long long total_warps;
+    int cuda_event_timing;
+};
+
 static struct code_item* g_code_map = NULL;
 static struct stream_anchor* g_anchors = NULL;
 static struct launch_item* g_pending = NULL;
 static struct event_pair* g_event_pool = NULL;
+static struct launch_emit_record* g_launch_emit_queue = NULL;
+static size_t g_launch_emit_cap = 0;
+static size_t g_launch_emit_head = 0;
+static size_t g_launch_emit_tail = 0;
+static size_t g_launch_emit_count = 0;
+static pthread_mutex_t g_launch_emit_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_launch_emit_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_launch_emit_thread;
+static int g_launch_emit_started = 0;
+static int g_launch_emit_stop = 0;
 
 static int cuda_events_ready(void);
 
@@ -222,6 +257,20 @@ static int env_flag(const char* name, int default_value) {
     }
     return !(strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
              strcasecmp(value, "off") == 0 || strcasecmp(value, "no") == 0);
+}
+
+static unsigned long env_ulong(const char* name, unsigned long default_value) {
+    const char* value = getenv(name);
+    if (!value || !value[0]) {
+        return default_value;
+    }
+    char* end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || parsed == 0) {
+        return default_value;
+    }
+    return parsed;
 }
 
 static dlsym_fn_t real_dlsym_func = NULL;
@@ -398,7 +447,9 @@ static void refresh_getproc_symbols(void) {
             real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress_v2");
         }
     }
-    g_getproc_symbols_refreshed = 1;
+    if (real_cuGetProcAddress || real_cuGetProcAddress_v2) {
+        g_getproc_symbols_refreshed = 1;
+    }
 }
 
 static void refresh_driver_symbols(void) {
@@ -523,7 +574,10 @@ static void refresh_driver_symbols(void) {
         }
     }
     refresh_getproc_symbols();
-    g_driver_symbols_refreshed = 1;
+    if (real_cuLaunchKernel || real_cuLaunchKernel_ptsz ||
+        real_cuLaunchKernelEx || real_cuLaunchKernelEx_ptsz) {
+        g_driver_symbols_refreshed = 1;
+    }
 }
 
 static void refresh_runtime_symbols(void) {
@@ -570,7 +624,11 @@ static void refresh_runtime_symbols(void) {
                 (cudaLaunchCooperativeKernel_t)dlsym_libcudart("cudaLaunchCooperativeKernel_ptsz");
         }
     }
-    g_runtime_symbols_refreshed = 1;
+    if (real_cudaLaunchKernel || real_cudaLaunchKernel_ptsz ||
+        real_cudaLaunchKernelExC || real_cudaLaunchKernelExC_ptsz ||
+        real_cudaLaunchCooperativeKernel || real_cudaLaunchCooperativeKernel_ptsz) {
+        g_runtime_symbols_refreshed = 1;
+    }
 }
 
 static void refresh_nccl_symbols(void) {
@@ -601,7 +659,10 @@ static void refresh_nccl_symbols(void) {
             real_ncclBroadcast = (ncclBroadcast_t)dlsym_libnccl("ncclBroadcast");
         }
     }
-    g_nccl_symbols_refreshed = 1;
+    if (real_ncclAllReduce || real_ncclAllGather ||
+        real_ncclReduceScatter || real_ncclBroadcast) {
+        g_nccl_symbols_refreshed = 1;
+    }
 }
 
 static void json_escape(const char* in, char* out, size_t out_size) {
@@ -657,6 +718,118 @@ static void send_json(const char* fmt, ...) {
         n = (int)sizeof(buf) - 1;
     }
     send_raw(buf, (size_t)n);
+}
+
+static void format_send_launch_record(const struct launch_emit_record* rec) {
+    if (!rec) {
+        return;
+    }
+    char escaped[512];
+    json_escape(rec->kernel_name, escaped, sizeof(escaped));
+    char buf[4096];
+    unsigned long long threads_per_block =
+        (unsigned long long)rec->block[0] * rec->block[1] * rec->block[2];
+    unsigned long long blocks_total =
+        (unsigned long long)rec->grid[0] * rec->grid[1] * rec->grid[2];
+    int n = snprintf(
+        buf, sizeof(buf),
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_launch\",\"source\":\"weaver_hook\",\"kernel_name\":\"%s\",\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"dur_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"stream\":\"%p\",\"payload\":{\"launch_id\":%llu,\"ret\":%d,\"kernel\":\"%s\",\"kernel_name\":\"%s\",\"func\":\"%p\",\"stream\":\"%p\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared_mem\":%u,\"shared_memory\":%u,\"threads_per_block\":%llu,\"blocks_total\":%llu,\"warps_per_block\":%llu,\"total_warps\":%llu,\"warp_size\":32,\"warp_scope\":\"block_runtime\",\"gpu_duration_ns\":%lld,\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"cuda_event_timing\":%s,\"time_alignment\":\"%s\",\"poll_ready_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld}}",
+        rec->gpu_start_ns, rec->pid, rec->tid, escaped,
+        rec->gpu_start_ns, rec->gpu_end_ns, rec->gpu_duration_ns,
+        rec->cpu_enqueue_start_ns, rec->cpu_enqueue_end_ns, rec->stream,
+        rec->launch_id, rec->ret, escaped, escaped, rec->func, rec->stream,
+        rec->grid[0], rec->grid[1], rec->grid[2],
+        rec->block[0], rec->block[1], rec->block[2],
+        rec->shared_mem, rec->shared_mem,
+        threads_per_block, blocks_total,
+        rec->warps_per_block, rec->total_warps,
+        rec->gpu_duration_ns, rec->gpu_start_ns, rec->gpu_end_ns,
+        rec->cuda_event_timing ? "true" : "false", rec->alignment,
+        rec->poll_ready_ns, rec->cpu_enqueue_start_ns, rec->cpu_enqueue_end_ns);
+    if (n <= 0) {
+        return;
+    }
+    if (n >= (int)sizeof(buf)) {
+        n = (int)sizeof(buf) - 1;
+    }
+    send_raw(buf, (size_t)n);
+}
+
+static void* launch_emit_loop(void* unused) {
+    (void)unused;
+    while (1) {
+        pthread_mutex_lock(&g_launch_emit_lock);
+        while (g_launch_emit_count == 0 && !g_launch_emit_stop) {
+            pthread_cond_wait(&g_launch_emit_cond, &g_launch_emit_lock);
+        }
+        if (g_launch_emit_count == 0 && g_launch_emit_stop) {
+            pthread_mutex_unlock(&g_launch_emit_lock);
+            break;
+        }
+        struct launch_emit_record rec = g_launch_emit_queue[g_launch_emit_head];
+        g_launch_emit_head = (g_launch_emit_head + 1U) % g_launch_emit_cap;
+        g_launch_emit_count--;
+        pthread_mutex_unlock(&g_launch_emit_lock);
+        format_send_launch_record(&rec);
+    }
+    return NULL;
+}
+
+static void start_launch_emit_thread(void) {
+    if (!g_async_launch_emit || g_launch_emit_started || g_sock < 0) {
+        return;
+    }
+    unsigned long cap = env_ulong("WEAVER_LAUNCH_EMIT_QUEUE_SIZE", 8192UL);
+    if (cap < 256UL) {
+        cap = 256UL;
+    }
+    g_launch_emit_queue = (struct launch_emit_record*)calloc(cap, sizeof(*g_launch_emit_queue));
+    if (!g_launch_emit_queue) {
+        return;
+    }
+    g_launch_emit_cap = (size_t)cap;
+    g_launch_emit_head = 0;
+    g_launch_emit_tail = 0;
+    g_launch_emit_count = 0;
+    g_launch_emit_stop = 0;
+    if (pthread_create(&g_launch_emit_thread, NULL, launch_emit_loop, NULL) == 0) {
+        g_launch_emit_started = 1;
+    }
+}
+
+static int enqueue_launch_record(const struct launch_emit_record* rec) {
+    if (!rec || !g_async_launch_emit || !g_launch_emit_started || !g_launch_emit_queue) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_launch_emit_lock);
+    if (g_launch_emit_count == g_launch_emit_cap) {
+        pthread_mutex_unlock(&g_launch_emit_lock);
+        return 0;
+    }
+    g_launch_emit_queue[g_launch_emit_tail] = *rec;
+    g_launch_emit_tail = (g_launch_emit_tail + 1U) % g_launch_emit_cap;
+    g_launch_emit_count++;
+    pthread_cond_signal(&g_launch_emit_cond);
+    pthread_mutex_unlock(&g_launch_emit_lock);
+    return 1;
+}
+
+static void stop_launch_emit_thread(void) {
+    if (!g_launch_emit_started) {
+        free(g_launch_emit_queue);
+        g_launch_emit_queue = NULL;
+        g_launch_emit_cap = 0;
+        return;
+    }
+    pthread_mutex_lock(&g_launch_emit_lock);
+    g_launch_emit_stop = 1;
+    pthread_cond_broadcast(&g_launch_emit_cond);
+    pthread_mutex_unlock(&g_launch_emit_lock);
+    pthread_join(g_launch_emit_thread, NULL);
+    g_launch_emit_started = 0;
+    free(g_launch_emit_queue);
+    g_launch_emit_queue = NULL;
+    g_launch_emit_cap = 0;
 }
 
 static size_t elf_size(const unsigned char* data, size_t max_scan) {
@@ -1070,23 +1243,37 @@ static void emit_kernel_launch(struct launch_item* item, long long ready_ns,
                                long long gpu_duration_ns, long long gpu_start_ns,
                                long long gpu_end_ns, const char* alignment,
                                int cuda_event_timing) {
-    char escaped[1024];
-    json_escape(item->kernel_name, escaped, sizeof(escaped));
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_launch\",\"source\":\"weaver_hook\",\"kernel_name\":\"%s\",\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"dur_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"stream\":\"%p\",\"payload\":{\"launch_id\":%llu,\"ret\":%d,\"kernel\":\"%s\",\"kernel_name\":\"%s\",\"func\":\"%p\",\"stream\":\"%p\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared_mem\":%u,\"shared_memory\":%u,\"threads_per_block\":%llu,\"blocks_total\":%llu,\"warps_per_block\":%llu,\"total_warps\":%llu,\"warp_size\":32,\"warp_scope\":\"block_runtime\",\"gpu_duration_ns\":%lld,\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"cuda_event_timing\":%s,\"time_alignment\":\"%s\",\"poll_ready_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld}}",
-        gpu_start_ns, getpid(), (unsigned long long)pthread_self(), escaped,
-        gpu_start_ns, gpu_end_ns, gpu_duration_ns,
-        item->cpu_enqueue_start_ns, item->cpu_enqueue_end_ns, item->stream,
-        item->launch_id, item->ret, escaped, escaped, item->func, item->stream,
-        item->grid[0], item->grid[1], item->grid[2],
-        item->block[0], item->block[1], item->block[2],
-        item->shared_mem, item->shared_mem,
-        (unsigned long long)item->block[0] * item->block[1] * item->block[2],
-        (unsigned long long)item->grid[0] * item->grid[1] * item->grid[2],
-        item->warps_per_block, item->total_warps,
-        gpu_duration_ns, gpu_start_ns, gpu_end_ns,
-        cuda_event_timing ? "true" : "false", alignment, ready_ns,
-        item->cpu_enqueue_start_ns, item->cpu_enqueue_end_ns);
+    struct launch_emit_record rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.ts_ns = gpu_start_ns;
+    rec.pid = getpid();
+    rec.tid = (unsigned long long)pthread_self();
+    snprintf(rec.kernel_name, sizeof(rec.kernel_name), "%s",
+             item->kernel_name ? item->kernel_name : "<unknown>");
+    snprintf(rec.alignment, sizeof(rec.alignment), "%s", alignment ? alignment : "");
+    rec.gpu_start_ns = gpu_start_ns;
+    rec.gpu_end_ns = gpu_end_ns;
+    rec.gpu_duration_ns = gpu_duration_ns;
+    rec.cpu_enqueue_start_ns = item->cpu_enqueue_start_ns;
+    rec.cpu_enqueue_end_ns = item->cpu_enqueue_end_ns;
+    rec.poll_ready_ns = ready_ns;
+    rec.func = item->func;
+    rec.stream = item->stream;
+    rec.launch_id = item->launch_id;
+    rec.ret = item->ret;
+    rec.grid[0] = item->grid[0];
+    rec.grid[1] = item->grid[1];
+    rec.grid[2] = item->grid[2];
+    rec.block[0] = item->block[0];
+    rec.block[1] = item->block[1];
+    rec.block[2] = item->block[2];
+    rec.shared_mem = item->shared_mem;
+    rec.warps_per_block = item->warps_per_block;
+    rec.total_warps = item->total_warps;
+    rec.cuda_event_timing = cuda_event_timing;
+    if (!enqueue_launch_record(&rec)) {
+        format_send_launch_record(&rec);
+    }
 }
 
 static void emit_launch_resolve_error(const char* api_name) {
@@ -1205,6 +1392,7 @@ static void init_runtime(void) {
     g_patch_getproc = env_flag("WEAVER_PATCH_GETPROC", 1);
     g_disasm_enabled = env_flag("WEAVER_ENABLE_DISASM", 0);
     g_emit_code_events = env_flag("WEAVER_EMIT_CODE_EVENTS", 0);
+    g_async_launch_emit = env_flag("WEAVER_ASYNC_LAUNCH_EMIT", 1);
     if (g_disasm_enabled) {
         signal(SIGCHLD, SIG_IGN);
     }
@@ -1221,12 +1409,13 @@ static void init_runtime(void) {
     }
 
     g_should_run = 1;
+    start_launch_emit_thread();
     if (g_cuda_event_enabled && pthread_create(&g_poller, NULL, poller_run, NULL) == 0) {
         g_poller_started = 1;
     }
 
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"async_launch_emit\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
         now_ns(), getpid(), (unsigned long long)pthread_self(),
         (g_cuda_event_enabled && real_cuEventCreate && real_cuEventRecord &&
          real_cuEventQuery && real_cuEventElapsedTime) ? "true" : "false",
@@ -1236,6 +1425,7 @@ static void init_runtime(void) {
         g_patch_getproc ? "true" : "false",
         g_disasm_enabled ? "true" : "false",
         g_emit_code_events ? "true" : "false",
+        g_async_launch_emit ? "true" : "false",
         real_cuLaunchKernel ? "true" : "false",
         real_cudaLaunchKernel ? "true" : "false",
         real_cuGetProcAddress ? "true" : "false",
@@ -1256,6 +1446,7 @@ __attribute__((destructor)) static void weaver_fini(void) {
     if (g_poller_started) {
         pthread_join(g_poller, NULL);
     }
+    stop_launch_emit_thread();
     destroy_event_pool();
     if (g_sock >= 0) {
         close(g_sock);

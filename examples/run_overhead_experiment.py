@@ -249,6 +249,7 @@ def mode_env(
         env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "0")
         env.setdefault("WEAVER_CUDA_EVENT_POOL", "1")
         env.setdefault("WEAVER_EMIT_CODE_EVENTS", "0")
+        env.setdefault("WEAVER_ASYNC_LAUNCH_EMIT", "1")
         env["WEAVER_PATCH_DLSYM"] = "1"
         env.setdefault("WEAVER_PATCH_GETPROC", "1")
         env["WEAVER_TRACE_DIR"] = str(run_dir / "captured_kernels")
