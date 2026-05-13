@@ -224,6 +224,7 @@ static int env_flag(const char* name, int default_value) {
 
 static dlsym_fn_t real_dlsym_func = NULL;
 static void* g_libcuda_handle = NULL;
+static void* g_libcudart_handle = NULL;
 static void* g_libnccl_handle = NULL;
 
 static dlsym_fn_t get_real_dlsym(void) {
@@ -269,6 +270,31 @@ static void* dlsym_libcuda(const char* symbol) {
     }
     dlsym_fn_t real_dlsym = get_real_dlsym();
     return real_dlsym ? real_dlsym(g_libcuda_handle, symbol) : NULL;
+}
+
+static void ensure_libcudart_loaded(void) {
+    if (g_libcudart_handle) {
+        return;
+    }
+    g_libcudart_handle = dlopen("libcudart.so.12", RTLD_NOW | RTLD_GLOBAL);
+    if (!g_libcudart_handle) {
+        g_libcudart_handle = dlopen("libcudart.so.11.0", RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (!g_libcudart_handle) {
+        g_libcudart_handle = dlopen("libcudart.so", RTLD_NOW | RTLD_GLOBAL);
+    }
+}
+
+static void* dlsym_libcudart(const char* symbol) {
+    if (!symbol) {
+        return NULL;
+    }
+    ensure_libcudart_loaded();
+    if (!g_libcudart_handle) {
+        return NULL;
+    }
+    dlsym_fn_t real_dlsym = get_real_dlsym();
+    return real_dlsym ? real_dlsym(g_libcudart_handle, symbol) : NULL;
 }
 
 static void ensure_libnccl_loaded(void) {
@@ -436,25 +462,46 @@ static void refresh_driver_symbols(void) {
 }
 
 static void refresh_runtime_symbols(void) {
+    ensure_libcudart_loaded();
     if (!real_cudaLaunchKernel) {
         real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)dlsym_next_any("cudaLaunchKernel", NULL);
+        if (!real_cudaLaunchKernel) {
+            real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)dlsym_libcudart("cudaLaunchKernel");
+        }
     }
     if (!real_cudaLaunchKernel_ptsz) {
         real_cudaLaunchKernel_ptsz = (cudaLaunchKernel_runtime_t)dlsym_next_any("cudaLaunchKernel_ptsz", NULL);
+        if (!real_cudaLaunchKernel_ptsz) {
+            real_cudaLaunchKernel_ptsz = (cudaLaunchKernel_runtime_t)dlsym_libcudart("cudaLaunchKernel_ptsz");
+        }
     }
     if (!real_cudaLaunchKernelExC) {
         real_cudaLaunchKernelExC = (cudaLaunchKernelExC_t)dlsym_next_any("cudaLaunchKernelExC", NULL);
+        if (!real_cudaLaunchKernelExC) {
+            real_cudaLaunchKernelExC = (cudaLaunchKernelExC_t)dlsym_libcudart("cudaLaunchKernelExC");
+        }
     }
     if (!real_cudaLaunchKernelExC_ptsz) {
         real_cudaLaunchKernelExC_ptsz = (cudaLaunchKernelExC_t)dlsym_next_any("cudaLaunchKernelExC_ptsz", NULL);
+        if (!real_cudaLaunchKernelExC_ptsz) {
+            real_cudaLaunchKernelExC_ptsz = (cudaLaunchKernelExC_t)dlsym_libcudart("cudaLaunchKernelExC_ptsz");
+        }
     }
     if (!real_cudaLaunchCooperativeKernel) {
         real_cudaLaunchCooperativeKernel =
             (cudaLaunchCooperativeKernel_t)dlsym_next_any("cudaLaunchCooperativeKernel", NULL);
+        if (!real_cudaLaunchCooperativeKernel) {
+            real_cudaLaunchCooperativeKernel =
+                (cudaLaunchCooperativeKernel_t)dlsym_libcudart("cudaLaunchCooperativeKernel");
+        }
     }
     if (!real_cudaLaunchCooperativeKernel_ptsz) {
         real_cudaLaunchCooperativeKernel_ptsz =
             (cudaLaunchCooperativeKernel_t)dlsym_next_any("cudaLaunchCooperativeKernel_ptsz", NULL);
+        if (!real_cudaLaunchCooperativeKernel_ptsz) {
+            real_cudaLaunchCooperativeKernel_ptsz =
+                (cudaLaunchCooperativeKernel_t)dlsym_libcudart("cudaLaunchCooperativeKernel_ptsz");
+        }
     }
 }
 
@@ -971,6 +1018,14 @@ static void emit_kernel_launch(struct launch_item* item, long long ready_ns,
         item->cpu_enqueue_start_ns, item->cpu_enqueue_end_ns);
 }
 
+static void emit_launch_resolve_error(const char* api_name) {
+    char escaped[128];
+    json_escape(api_name ? api_name : "", escaped, sizeof(escaped));
+    send_json(
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"launch_resolve_error\",\"payload\":{\"api\":\"%s\"}}",
+        now_ns(), getpid(), (unsigned long long)pthread_self(), escaped);
+}
+
 static void destroy_launch_item(struct launch_item* item) {
     if (!item) {
         return;
@@ -1412,6 +1467,7 @@ CUresult cuLaunchKernel(CUfunction f,
     init_once();
     refresh_driver_symbols();
     if (!real_cuLaunchKernel) {
+        emit_launch_resolve_error("cuLaunchKernel");
         return 1;
     }
     return handle_launch(f, gridDimX, gridDimY, gridDimZ,
@@ -1435,6 +1491,7 @@ CUresult cuLaunchKernel_ptsz(CUfunction f,
     refresh_driver_symbols();
     cuLaunchKernel_t launcher = real_cuLaunchKernel_ptsz ? real_cuLaunchKernel_ptsz : real_cuLaunchKernel;
     if (!launcher) {
+        emit_launch_resolve_error("cuLaunchKernel_ptsz");
         return 1;
     }
     return handle_launch(f, gridDimX, gridDimY, gridDimZ,
@@ -1531,6 +1588,7 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** ker
     init_once();
     refresh_driver_symbols();
     if (!real_cuLaunchKernelEx) {
+        emit_launch_resolve_error("cuLaunchKernelEx");
         return 1;
     }
     return handle_launch_ex(config, f, kernelParams, extra,
@@ -1542,6 +1600,7 @@ CUresult cuLaunchKernelEx_ptsz(const CUlaunchConfig* config, CUfunction f, void*
     refresh_driver_symbols();
     cuLaunchKernelEx_t launcher = real_cuLaunchKernelEx_ptsz ? real_cuLaunchKernelEx_ptsz : real_cuLaunchKernelEx;
     if (!launcher) {
+        emit_launch_resolve_error("cuLaunchKernelEx_ptsz");
         return 1;
     }
     return handle_launch_ex(config, f, kernelParams, extra,
@@ -1637,6 +1696,7 @@ cudaError_t cudaLaunchKernel(const void* func,
     init_once();
     refresh_runtime_symbols();
     if (!real_cudaLaunchKernel) {
+        emit_launch_resolve_error("cudaLaunchKernel");
         return 1;
     }
     return handle_runtime_launch(func, gridDim, blockDim, args, sharedMem, stream,
@@ -1654,6 +1714,7 @@ cudaError_t cudaLaunchKernel_ptsz(const void* func,
     cudaLaunchKernel_runtime_t launcher =
         real_cudaLaunchKernel_ptsz ? real_cudaLaunchKernel_ptsz : real_cudaLaunchKernel;
     if (!launcher) {
+        emit_launch_resolve_error("cudaLaunchKernel_ptsz");
         return 1;
     }
     return handle_runtime_launch(func, gridDim, blockDim, args, sharedMem, stream,
@@ -1669,6 +1730,7 @@ cudaError_t cudaLaunchCooperativeKernel(const void* func,
     init_once();
     refresh_runtime_symbols();
     if (!real_cudaLaunchCooperativeKernel) {
+        emit_launch_resolve_error("cudaLaunchCooperativeKernel");
         return 1;
     }
     return handle_runtime_launch(func, gridDim, blockDim, args, sharedMem, stream,
@@ -1688,6 +1750,7 @@ cudaError_t cudaLaunchCooperativeKernel_ptsz(const void* func,
         real_cudaLaunchCooperativeKernel_ptsz ?
         real_cudaLaunchCooperativeKernel_ptsz : real_cudaLaunchCooperativeKernel;
     if (!launcher) {
+        emit_launch_resolve_error("cudaLaunchCooperativeKernel_ptsz");
         return 1;
     }
     return handle_runtime_launch(func, gridDim, blockDim, args, sharedMem, stream,
@@ -1784,6 +1847,7 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_runtime* config,
     init_once();
     refresh_runtime_symbols();
     if (!real_cudaLaunchKernelExC) {
+        emit_launch_resolve_error("cudaLaunchKernelExC");
         return 1;
     }
     return handle_runtime_launch_ex(config, func, args,
@@ -1799,6 +1863,7 @@ cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_runtime* config,
     cudaLaunchKernelExC_t launcher =
         real_cudaLaunchKernelExC_ptsz ? real_cudaLaunchKernelExC_ptsz : real_cudaLaunchKernelExC;
     if (!launcher) {
+        emit_launch_resolve_error("cudaLaunchKernelExC_ptsz");
         return 1;
     }
     return handle_runtime_launch_ex(config, func, args,
