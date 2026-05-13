@@ -152,7 +152,7 @@ static int g_cuda_event_enabled = 0;
 static int g_sync_stream_anchor = 0;
 static int g_cuda_event_pool_enabled = 1;
 static int g_trace_getproc_errors = 0;
-static int g_patch_dlsym = 1;
+static int g_patch_dlsym = 0;
 static int g_patch_getproc = 1;
 static unsigned long long g_launch_seq = 0;
 
@@ -233,9 +233,6 @@ static dlsym_fn_t get_real_dlsym(void) {
         real_dlsym_func = (dlsym_fn_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
         if (!real_dlsym_func) {
             real_dlsym_func = (dlsym_fn_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
-        }
-        if (!real_dlsym_func) {
-            real_dlsym_func = (dlsym_fn_t)dlsym;
         }
     }
 #else
@@ -1125,12 +1122,6 @@ static int cuda_events_ready(void) {
            real_cuEventQuery && real_cuEventElapsedTime;
 }
 
-static void init_symbols(void) {
-    refresh_driver_symbols();
-    refresh_runtime_symbols();
-    refresh_nccl_symbols();
-}
-
 static void init_runtime(void) {
     g_cuda_event_enabled = env_flag("WEAVER_CUDA_EVENTS", 0);
     g_sync_stream_anchor = env_flag("WEAVER_CUDA_SYNC_ANCHOR", 0);
@@ -1138,7 +1129,6 @@ static void init_runtime(void) {
     g_trace_getproc_errors = env_flag("WEAVER_TRACE_GETPROC_ERRORS", 0);
     g_patch_dlsym = env_flag("WEAVER_PATCH_DLSYM", 1);
     g_patch_getproc = env_flag("WEAVER_PATCH_GETPROC", 1);
-    init_symbols();
     signal(SIGCHLD, SIG_IGN);
 
     const char* sock = getenv("WEAVER_SOCK");
@@ -2074,14 +2064,19 @@ void* dlsym(void* handle, const char* symbol) {
     if (!real_dlsym) {
         return NULL;
     }
-    if (symbol && strcmp(symbol, "dlsym") == 0) {
+    uintptr_t symbol_addr = (uintptr_t)symbol;
+    if (symbol_addr == 0) {
+        return NULL;
+    }
+    const char* sym = (const char*)symbol_addr;
+    if (strcmp(sym, "dlsym") == 0) {
         return (void*)real_dlsym;
     }
-    void* fn = real_dlsym(handle, symbol);
+    void* fn = real_dlsym(handle, sym);
     if (!g_patch_dlsym) {
         return fn;
     }
-    return patch_symbol_pointer(symbol, fn);
+    return patch_symbol_pointer(sym, fn);
 }
 #endif
 

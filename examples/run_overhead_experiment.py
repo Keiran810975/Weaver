@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Optional
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD = ROOT / "examples" / "overhead_workload.py"
 HOOK = ROOT / "hooks" / "libweaver_hook.so"
+RUNNER_VERSION = "low_overhead_guard_v2"
 
 PRESETS = {
     "quick": {
@@ -457,6 +458,8 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
 
     summary = {
         "experiment": "weaver_three_layer_collection_overhead",
+        "runner_version": RUNNER_VERSION,
+        "runner_path": str(Path(__file__).resolve()),
         "method": {
             "preset": args.preset,
             "baseline": "same dual-GPU workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
@@ -518,6 +521,10 @@ def main() -> None:
         if stale_path.exists():
             stale_path.unlink()
     modes = split_modes(args.modes)
+    print(
+        f"[weaver-overhead] runner={RUNNER_VERSION} script={Path(__file__).resolve()} output_dir={out_dir}",
+        flush=True,
+    )
 
     if any(needs_hook(mode) for mode in modes):
         if not args.skip_hook_build:
