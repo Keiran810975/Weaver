@@ -35,8 +35,8 @@ Useful environment knobs:
 - `WEAVER_REQUIRE_NATIVE_PY=1`: fail fast if the native collector was not built, instead of silently falling back.
 - `WEAVER_PYTHON_SAMPLE_RATE`: sample every N matched Python operator calls; keep `1` for a full Python trace.
 - `WEAVER_TRACE_GC=0/1`: disable or enable Python GC pause events.
-- `WEAVER_ENABLE_DISASM=1`: capture loaded GPU code and run the Neutrino-style disassembly sidecar.
-- `WEAVER_CUDA_EVENTS=1`: use CUDA Event start/stop records and the background poller.
+- `WEAVER_ENABLE_DISASM=1`: opt into loaded GPU code capture and the Neutrino-style disassembly sidecar. Default is `0` for the low-overhead normal path.
+- `WEAVER_CUDA_EVENTS=1`: opt into CUDA Event start/stop records and the background poller. Default is `0`; normal collection records CPU enqueue time plus launch metadata.
 - `WEAVER_CUDA_EVENT_POOL=1`: reuse CUDA Event pairs across launches to avoid per-launch create/destroy overhead.
 - `WEAVER_CUDA_SYNC_ANCHOR=1`: optionally synchronize a per-stream anchor to align CUDA Event times onto host time more tightly.
 
@@ -181,7 +181,7 @@ PYTHONPATH=. python examples/run_overhead_experiment.py \
 	--output-dir ./overhead_v100_quick
 ```
 
-The quick preset is sized for a 2xV100 node and should finish in roughly five minutes or less. It compares the same workload without collection, with Weaver's three-layer collection, and with Weaver disassembly disabled. `torch_profiler` remains available as an optional reference mode. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
+The quick preset is sized for a 2xV100 node and should finish in roughly five minutes or less. It compares the same workload without collection, with Weaver's low-overhead three-layer collection, and with `torch_profiler` as a reference. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
 
 The quick preset uses sampled Python operator collection (`--python-sample-rate 10`). Use `--python-sample-rate 1` to measure the full Python profile trace separately from the low-overhead setting.
 

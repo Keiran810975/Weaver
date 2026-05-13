@@ -3,16 +3,16 @@
 This experiment measures the steady-state cost of Weaver's three-layer collector:
 
 1. Native CPython `PyEval_SetProfile` operator collection with code-object address matching.
-2. LD_PRELOAD CUDA/NCCL launch interception with CUDA Event timing, event-pair reuse, and async polling.
-3. Neutrino-style hook-after binary capture plus PTX/SASS disassembly sidecar.
+2. LD_PRELOAD CUDA/NCCL launch interception in the low-overhead CPU-enqueue path.
+3. Warp/block launch metadata derived online from grid/block geometry.
 
 ## Core Idea
 
 Run the exact same dual-GPU DDP training workload under several modes:
 
 - `baseline`: no daemon, no CPython profile hook, no LD_PRELOAD hook.
-- `weaver_full`: daemon + native CPython hook + CUDA/NCCL hook + CUDA Event poller + disassembly sidecar.
-- `weaver_no_disasm`: same as Weaver, but disables one-time binary disassembly to isolate steady-state online cost.
+- `weaver_full`: daemon + native CPython hook + CUDA/NCCL hook with CPU enqueue timing and launch metadata.
+- `weaver_no_disasm`: compatibility mode; normal collection already disables the disassembly sidecar.
 - `torch_profiler`: PyTorch profiler reference mode.
 
 The primary metric is median per-step host wall time after warmup:
@@ -21,7 +21,7 @@ The primary metric is median per-step host wall time after warmup:
 overhead_pct = (median_step_ms(mode) - median_step_ms(baseline)) / median_step_ms(baseline) * 100
 ```
 
-GPU Event step time, p95 step time, event count, and emitted event bytes are secondary metrics. Warmup iterations are excluded so one-time kernel capture/disassembly is amortized, which matches the intended online usage.
+GPU step time, p95 step time, event count, and emitted event bytes are secondary metrics. CUDA Event per-kernel timing is a deep-diagnosis option (`WEAVER_CUDA_EVENTS=1`) and is intentionally disabled in the normal low-overhead path.
 
 By default the Weaver Python layer uses the native C collector, samples every 10
 matched operator calls (`--python-sample-rate 10`), and disables GC events for
@@ -110,6 +110,6 @@ Use `weaver_full` versus `baseline` as the main result. A good low-overhead clai
 - p95 host step overhead;
 - GPU step overhead;
 - event MB per step;
-- whether `weaver_full` is close to `weaver_no_disasm` after warmup.
+- whether `weaver_full` is below the optional `torch_profiler` reference.
 
-Use `torch_profiler` only as a familiar reference point. It is expected to have much higher overhead and event volume than Weaver because it records a broader trace.
+Use `torch_profiler` only as a familiar reference point. The normal Weaver path should be no slower than this reference; if `WEAVER_CUDA_EVENTS=1` is enabled, report it separately as deep timing diagnosis rather than the low-overhead result.
