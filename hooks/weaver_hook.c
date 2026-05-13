@@ -151,6 +151,9 @@ static int g_should_run = 1;
 static int g_cuda_event_enabled = 1;
 static int g_sync_stream_anchor = 0;
 static int g_cuda_event_pool_enabled = 1;
+static int g_trace_getproc_errors = 0;
+static int g_patch_dlsym = 0;
+static int g_patch_getproc = 0;
 static unsigned long long g_launch_seq = 0;
 
 struct code_item {
@@ -220,6 +223,8 @@ static int env_flag(const char* name, int default_value) {
 }
 
 static dlsym_fn_t real_dlsym_func = NULL;
+static void* g_libcuda_handle = NULL;
+static void* g_libnccl_handle = NULL;
 
 static dlsym_fn_t get_real_dlsym(void) {
 #ifdef __linux__
@@ -228,6 +233,9 @@ static dlsym_fn_t get_real_dlsym(void) {
         if (!real_dlsym_func) {
             real_dlsym_func = (dlsym_fn_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
         }
+        if (!real_dlsym_func) {
+            real_dlsym_func = (dlsym_fn_t)dlsym;
+        }
     }
 #else
     if (!real_dlsym_func) {
@@ -235,6 +243,52 @@ static dlsym_fn_t get_real_dlsym(void) {
     }
 #endif
     return real_dlsym_func;
+}
+
+// Forward declarations for cuGetProcAddress wrappers used in symbol refresh.
+CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion, uint64_t flags, void* symbolStatus);
+CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, uint64_t flags, void* symbolStatus);
+
+static void ensure_libcuda_loaded(void) {
+    if (g_libcuda_handle) {
+        return;
+    }
+    g_libcuda_handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!g_libcuda_handle) {
+        g_libcuda_handle = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+    }
+}
+
+static void* dlsym_libcuda(const char* symbol) {
+    if (!symbol) {
+        return NULL;
+    }
+    ensure_libcuda_loaded();
+    if (!g_libcuda_handle) {
+        return NULL;
+    }
+    return dlsym(g_libcuda_handle, symbol);
+}
+
+static void ensure_libnccl_loaded(void) {
+    if (g_libnccl_handle) {
+        return;
+    }
+    g_libnccl_handle = dlopen("libnccl.so.2", RTLD_NOW | RTLD_GLOBAL);
+    if (!g_libnccl_handle) {
+        g_libnccl_handle = dlopen("libnccl.so", RTLD_NOW | RTLD_GLOBAL);
+    }
+}
+
+static void* dlsym_libnccl(const char* symbol) {
+    if (!symbol) {
+        return NULL;
+    }
+    ensure_libnccl_loaded();
+    if (!g_libnccl_handle) {
+        return NULL;
+    }
+    return dlsym(g_libnccl_handle, symbol);
 }
 
 static void* dlsym_next_any(const char* name, const char* alt_name) {
@@ -247,6 +301,7 @@ static void* dlsym_next_any(const char* name, const char* alt_name) {
 }
 
 static void refresh_driver_symbols(void) {
+    ensure_libcuda_loaded();
     if (!real_cuModuleLoadData) {
         real_cuModuleLoadData = (cuModuleLoadData_t)dlsym_next_any("cuModuleLoadData", NULL);
     }
@@ -306,9 +361,15 @@ static void refresh_driver_symbols(void) {
     }
     if (!real_cuGetProcAddress) {
         real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress", NULL);
+        if (real_cuGetProcAddress == cuGetProcAddress) {
+            real_cuGetProcAddress = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress");
+        }
     }
     if (!real_cuGetProcAddress_v2) {
         real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_next_any("cuGetProcAddress_v2", NULL);
+        if (real_cuGetProcAddress_v2 == cuGetProcAddress_v2) {
+            real_cuGetProcAddress_v2 = (cuGetProcAddress_t)dlsym_libcuda("cuGetProcAddress_v2");
+        }
     }
 }
 
@@ -336,17 +397,30 @@ static void refresh_runtime_symbols(void) {
 }
 
 static void refresh_nccl_symbols(void) {
+    ensure_libnccl_loaded();
     if (!real_ncclAllReduce) {
         real_ncclAllReduce = (ncclAllReduce_t)dlsym_next_any("ncclAllReduce", NULL);
+        if (!real_ncclAllReduce) {
+            real_ncclAllReduce = (ncclAllReduce_t)dlsym_libnccl("ncclAllReduce");
+        }
     }
     if (!real_ncclAllGather) {
         real_ncclAllGather = (ncclAllGather_t)dlsym_next_any("ncclAllGather", NULL);
+        if (!real_ncclAllGather) {
+            real_ncclAllGather = (ncclAllGather_t)dlsym_libnccl("ncclAllGather");
+        }
     }
     if (!real_ncclReduceScatter) {
         real_ncclReduceScatter = (ncclReduceScatter_t)dlsym_next_any("ncclReduceScatter", NULL);
+        if (!real_ncclReduceScatter) {
+            real_ncclReduceScatter = (ncclReduceScatter_t)dlsym_libnccl("ncclReduceScatter");
+        }
     }
     if (!real_ncclBroadcast) {
         real_ncclBroadcast = (ncclBroadcast_t)dlsym_next_any("ncclBroadcast", NULL);
+        if (!real_ncclBroadcast) {
+            real_ncclBroadcast = (ncclBroadcast_t)dlsym_libnccl("ncclBroadcast");
+        }
     }
 }
 
@@ -934,6 +1008,9 @@ static void init_runtime(void) {
     g_cuda_event_enabled = env_flag("WEAVER_CUDA_EVENTS", 1);
     g_sync_stream_anchor = env_flag("WEAVER_CUDA_SYNC_ANCHOR", 0);
     g_cuda_event_pool_enabled = env_flag("WEAVER_CUDA_EVENT_POOL", 1);
+    g_trace_getproc_errors = env_flag("WEAVER_TRACE_GETPROC_ERRORS", 0);
+    g_patch_dlsym = env_flag("WEAVER_PATCH_DLSYM", 0);
+    g_patch_getproc = env_flag("WEAVER_PATCH_GETPROC", 0);
 
     const char* sock = getenv("WEAVER_SOCK");
     if (!sock || !sock[0]) {
@@ -1764,12 +1841,12 @@ static void* patch_symbol_pointer(const char* symbol, void* pfn) {
         }
         return (void*)cudaLaunchKernelExC_ptsz;
     } else if (strcmp(symbol, "cuGetProcAddress") == 0) {
-        if (!real_cuGetProcAddress) {
+        if (!real_cuGetProcAddress && pfn != (void*)cuGetProcAddress) {
             real_cuGetProcAddress = (cuGetProcAddress_t)pfn;
         }
         return (void*)cuGetProcAddress;
     } else if (strcmp(symbol, "cuGetProcAddress_v2") == 0) {
-        if (!real_cuGetProcAddress_v2) {
+        if (!real_cuGetProcAddress_v2 && pfn != (void*)cuGetProcAddress_v2) {
             real_cuGetProcAddress_v2 = (cuGetProcAddress_t)pfn;
         }
         return (void*)cuGetProcAddress_v2;
@@ -1791,11 +1868,24 @@ static CUresult call_real_cu_get_proc_address(cuGetProcAddress_t getter,
                                               uint64_t flags,
                                               void* symbolStatus) {
     if (!getter) {
-        return 1;
+        ensure_libcuda_loaded();
+        refresh_driver_symbols();
+        void* fn = dlsym_next_any(symbol, NULL);
+        if (!fn || !pfn) {
+            return 1;
+        }
+        *pfn = patch_symbol_pointer(symbol, fn);
+        return CU_SUCCESS;
     }
     CUresult ret = getter(symbol, pfn, cudaVersion, flags, symbolStatus);
     if (ret == CU_SUCCESS) {
         patch_driver_proc_address(symbol, pfn);
+    } else if (g_trace_getproc_errors) {
+        char escaped[256];
+        json_escape(symbol ? symbol : "", escaped, sizeof(escaped));
+        send_json(
+            "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"cu_get_proc_address_error\",\"payload\":{\"symbol\":\"%s\",\"ret\":%d}}",
+            now_ns(), getpid(), (unsigned long long)pthread_self(), escaped, ret);
     }
     return ret;
 }
@@ -1808,6 +1898,12 @@ CUresult cuGetProcAddress(const char* symbol,
     init_once();
     refresh_driver_symbols();
     cuGetProcAddress_t getter = real_cuGetProcAddress ? real_cuGetProcAddress : real_cuGetProcAddress_v2;
+    if (!g_patch_getproc) {
+        if (!getter || getter == cuGetProcAddress || getter == cuGetProcAddress_v2) {
+            return 1;
+        }
+        return getter(symbol, pfn, cudaVersion, flags, symbolStatus);
+    }
     return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus);
 }
 
@@ -1819,6 +1915,12 @@ CUresult cuGetProcAddress_v2(const char* symbol,
     init_once();
     refresh_driver_symbols();
     cuGetProcAddress_t getter = real_cuGetProcAddress_v2 ? real_cuGetProcAddress_v2 : real_cuGetProcAddress;
+    if (!g_patch_getproc) {
+        if (!getter || getter == cuGetProcAddress || getter == cuGetProcAddress_v2) {
+            return 1;
+        }
+        return getter(symbol, pfn, cudaVersion, flags, symbolStatus);
+    }
     return call_real_cu_get_proc_address(getter, symbol, pfn, cudaVersion, flags, symbolStatus);
 }
 
@@ -1832,6 +1934,9 @@ void* dlsym(void* handle, const char* symbol) {
         return (void*)real_dlsym;
     }
     void* fn = real_dlsym(handle, symbol);
+    if (!g_patch_dlsym) {
+        return fn;
+    }
     return patch_symbol_pointer(symbol, fn);
 }
 #endif
