@@ -1353,13 +1353,15 @@ static void* poller_run(void* unused) {
         struct launch_item** curp = &g_pending;
         while (*curp) {
             struct launch_item* item = *curp;
-            if (!emit_ready_launch_item(item)) {
+            CUresult q = real_cuEventQuery ? real_cuEventQuery(item->end_event) : 1;
+            if (q != CU_SUCCESS) {
                 curp = &((*curp)->next);
                 continue;
             }
 
             *curp = item->next;
             pthread_mutex_unlock(&g_queue_lock);
+            emit_ready_launch_item(item);
             destroy_launch_item(item);
 
             pthread_mutex_lock(&g_queue_lock);
