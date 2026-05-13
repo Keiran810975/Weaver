@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import signal
+import shutil
 import statistics
 import subprocess
 import sys
@@ -316,11 +317,12 @@ def count_weaver_events(path: Path) -> Dict[str, object]:
     }
 
 
-def has_measured_step_metrics(out_dir: Path, mode: str, rep: int) -> bool:
+def has_measured_step_metrics(out_dir: Path, mode: str, rep: int, expected_ranks: int) -> bool:
     paths = sorted((out_dir / mode / f"rep_{rep}").glob("rank_*/step_metrics.jsonl"))
-    if not paths:
+    if len(paths) < expected_ranks:
         return False
     for path in paths:
+        has_measured = False
         with path.open("r", encoding="utf-8") as f:
             for line in f:
                 try:
@@ -328,12 +330,17 @@ def has_measured_step_metrics(out_dir: Path, mode: str, rep: int) -> bool:
                 except json.JSONDecodeError:
                     continue
                 if row.get("measured"):
-                    return True
-    return False
+                    has_measured = True
+                    break
+        if not has_measured:
+            return False
+    return True
 
 
 def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dict[str, object]:
     run_dir = out_dir / mode / f"rep_{rep}"
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     sock = run_dir / "weaver.sock" if needs_daemon(mode) else None
     weaver_file = run_dir / "weaver_events.ndjson"
@@ -366,7 +373,7 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
             if tail:
                 detail += f"\n--- torchrun.log tail ---\n{tail}"
             raise RuntimeError(detail)
-        if not has_measured_step_metrics(out_dir, mode, rep):
+        if not has_measured_step_metrics(out_dir, mode, rep, args.nproc_per_node):
             tail = read_log_tail(log_path)
             detail = f"{mode} rep {rep} produced no measured step metrics; see {log_path}"
             if tail:
@@ -417,11 +424,18 @@ def percent_delta(value: float, baseline: float) -> float:
 def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run_results: List[Dict[str, object]]) -> Dict[str, object]:
     mode_summary: Dict[str, object] = {}
     for mode in modes:
-        host = summarize(load_step_values(out_dir, mode, "host_step_ms"))
-        gpu = summarize(load_step_values(out_dir, mode, "gpu_step_ms"))
-        forward = summarize(load_step_values(out_dir, mode, "forward_ms"))
-        backward = summarize(load_step_values(out_dir, mode, "backward_ms"))
-        comm = summarize(load_step_values(out_dir, mode, "explicit_comm_ms"))
+        host_values = load_step_values(out_dir, mode, "host_step_ms")
+        gpu_values = load_step_values(out_dir, mode, "gpu_step_ms")
+        forward_values = load_step_values(out_dir, mode, "forward_ms")
+        backward_values = load_step_values(out_dir, mode, "backward_ms")
+        comm_values = load_step_values(out_dir, mode, "explicit_comm_ms")
+        if not host_values or not gpu_values:
+            raise RuntimeError(f"{mode} has no measured step metrics; refusing to write a zero-valued summary")
+        host = summarize(host_values)
+        gpu = summarize(gpu_values)
+        forward = summarize(forward_values)
+        backward = summarize(backward_values)
+        comm = summarize(comm_values)
         mode_summary[mode] = {
             "host_step_ms": host,
             "gpu_step_ms": gpu,
@@ -499,6 +513,10 @@ def main() -> None:
     args = parse_args()
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    for stale_name in ("summary.json", "summary.md"):
+        stale_path = out_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
     modes = split_modes(args.modes)
 
     if any(needs_hook(mode) for mode in modes):
