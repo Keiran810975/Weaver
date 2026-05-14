@@ -254,9 +254,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--hook", default=str(_default_hook()))
     parser.add_argument(
         "--collection-mode",
-        choices=["adaptive_name", "name_only", "full"],
-        default=os.environ.get("WEAVER_COLLECTION_MODE", "adaptive_name"),
-        help="adaptive_name records expected kernels by name and times only triggered windows",
+        choices=["selective", "adaptive_name", "name_only", "full"],
+        default=os.environ.get("WEAVER_COLLECTION_MODE", "selective"),
+        help="selective times important kernels and records low-value kernels by name only",
     )
     parser.add_argument(
         "--sketch",

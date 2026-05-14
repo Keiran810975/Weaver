@@ -171,6 +171,7 @@ enum collection_mode {
     COLLECTION_FULL = 0,
     COLLECTION_NAME_ONLY = 1,
     COLLECTION_ADAPTIVE_NAME = 2,
+    COLLECTION_SELECTIVE = 3,
 };
 
 struct expected_kernel_pattern {
@@ -320,7 +321,7 @@ static pthread_cond_t g_launch_emit_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_launch_emit_thread;
 static int g_launch_emit_started = 0;
 static int g_launch_emit_stop = 0;
-static enum collection_mode g_collection_mode = COLLECTION_ADAPTIVE_NAME;
+static enum collection_mode g_collection_mode = COLLECTION_SELECTIVE;
 static struct expected_kernel_pattern* g_expected_kernels = NULL;
 static struct expected_sequence_node* g_expected_sequence = NULL;
 static struct sequence_cursor* g_sequence_cursors = NULL;
@@ -329,6 +330,8 @@ static unsigned long g_expected_sequence_count = 0;
 static unsigned long g_trigger_capture_after = 2;
 static unsigned long g_trigger_window_remaining = 0;
 static int g_trigger_unknown = 0;
+static int g_selective_timed_reduction = 0;
+static int g_selective_unknown_full = 0;
 static int g_sequence_repeat = 1;
 static int g_rank = -1;
 static int g_local_rank = -1;
@@ -466,8 +469,10 @@ static char* trim_inplace(char* text) {
 }
 
 static enum collection_mode parse_collection_mode(const char* value) {
-    if (!value || !value[0] ||
-        strcasecmp(value, "adaptive") == 0 ||
+    if (!value || !value[0]) {
+        return COLLECTION_SELECTIVE;
+    }
+    if (strcasecmp(value, "adaptive") == 0 ||
         strcasecmp(value, "adaptive_name") == 0 ||
         strcasecmp(value, "sketch") == 0 ||
         strcasecmp(value, "online") == 0) {
@@ -483,6 +488,12 @@ static enum collection_mode parse_collection_mode(const char* value) {
         strcasecmp(value, "cuda_event") == 0) {
         return COLLECTION_FULL;
     }
+    if (strcasecmp(value, "selective") == 0 ||
+        strcasecmp(value, "smart") == 0 ||
+        strcasecmp(value, "filtered") == 0 ||
+        strcasecmp(value, "low_overhead") == 0) {
+        return COLLECTION_SELECTIVE;
+    }
     return COLLECTION_ADAPTIVE_NAME;
 }
 
@@ -492,6 +503,8 @@ static const char* collection_mode_name(void) {
             return "full";
         case COLLECTION_NAME_ONLY:
             return "name_only";
+        case COLLECTION_SELECTIVE:
+            return "selective";
         case COLLECTION_ADAPTIVE_NAME:
         default:
             return "adaptive_name";
@@ -697,8 +710,87 @@ static int kernel_matches_expected(const char* kernel_name) {
 	    return 0;
 }
 
+static int kernel_name_contains_any(const char* kernel_name, const char* const* needles) {
+    if (kernel_name_is_unknown(kernel_name)) {
+        return 0;
+    }
+    for (int i = 0; needles[i]; i++) {
+        if (strcasestr(kernel_name, needles[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int kernel_is_memory_or_layout(const char* kernel_name) {
+    static const char* const needles[] = {
+        "memcpy", "copy", "dtod", "htod", "dtoh",
+        "transpose", "permute", "contiguous", NULL
+    };
+    return kernel_name_contains_any(kernel_name, needles);
+}
+
+static int kernel_is_gemm_like(const char* kernel_name) {
+    static const char* const needles[] = {
+        "gemm", "sgemm", "dgemm", "hgemm", "matmul",
+        "cublas", "cutlass", "triton_gemm", "triton_mm", NULL
+    };
+    return kernel_name_contains_any(kernel_name, needles);
+}
+
+static int kernel_is_nccl_like(const char* kernel_name) {
+    static const char* const needles[] = {
+        "nccl", "allreduce", "all_reduce", "allgather",
+        "reducescatter", "reduce_scatter", "broadcast", NULL
+    };
+    return kernel_name_contains_any(kernel_name, needles);
+}
+
+static int kernel_is_reduction_like(const char* kernel_name) {
+    static const char* const needles[] = {
+        "reduce", "reduction", "layer_norm", "layernorm",
+        "rms_norm", "softmax", "sum", "mean", "GammaBetaBackward", NULL
+    };
+    return kernel_name_contains_any(kernel_name, needles);
+}
+
+static int kernel_is_low_value_for_selective(const char* kernel_name) {
+    if (kernel_name_is_unknown(kernel_name) || strcmp(kernel_name, "<runtime_kernel>") == 0) {
+        return !g_selective_unknown_full;
+    }
+    static const char* const needles[] = {
+        "elementwise", "CUDAFunctor_add", "Gelu", "gelu",
+        "Silu", "silu", "relu", "sigmoid", "tanh",
+        "mse_kernel", "mse_backward",
+        "FillFunctor", "fill", "zero",
+        "Foreach", "foreach", "multi_tensor_apply",
+        "Adam", "adam", NULL
+    };
+    if (kernel_name_contains_any(kernel_name, needles)) {
+        return 1;
+    }
+    if (!g_selective_timed_reduction && kernel_is_reduction_like(kernel_name)) {
+        return 1;
+    }
+    return 0;
+}
+
+static int kernel_should_full_time_selective(const char* kernel_name) {
+    if (kernel_is_gemm_like(kernel_name) ||
+        kernel_is_nccl_like(kernel_name) ||
+        kernel_is_memory_or_layout(kernel_name)) {
+        return 1;
+    }
+    if (g_selective_timed_reduction && kernel_is_reduction_like(kernel_name)) {
+        return 1;
+    }
+    return !kernel_is_low_value_for_selective(kernel_name);
+}
+
 static void open_adaptive_trigger_window(void) {
-    if (g_collection_mode != COLLECTION_ADAPTIVE_NAME || g_trigger_capture_after == 0) {
+    if ((g_collection_mode != COLLECTION_ADAPTIVE_NAME &&
+         g_collection_mode != COLLECTION_SELECTIVE) ||
+        g_trigger_capture_after == 0) {
         return;
     }
     pthread_mutex_lock(&g_adaptive_lock);
@@ -756,10 +848,17 @@ static struct launch_capture_decision choose_launch_capture(const char* kernel_n
             g_trigger_window_remaining--;
             snprintf(decision.capture_mode, sizeof(decision.capture_mode), "trigger_window");
             snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "after_unexpected_kernel");
+        } else if (g_collection_mode == COLLECTION_SELECTIVE &&
+                   kernel_should_full_time_selective(kernel_name)) {
+            decision.full_timing = 1;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "selective_full");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "selective_important_kernel");
         } else {
             decision.full_timing = 0;
-            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "name_only");
-            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "matched_sequence_node");
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode),
+                     g_collection_mode == COLLECTION_SELECTIVE ? "selective_name_only" : "name_only");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason),
+                     g_collection_mode == COLLECTION_SELECTIVE ? "selective_low_value_kernel" : "matched_sequence_node");
         }
         pthread_mutex_unlock(&g_adaptive_lock);
         return decision;
@@ -793,10 +892,17 @@ static struct launch_capture_decision choose_launch_capture(const char* kernel_n
         g_trigger_window_remaining--;
         snprintf(decision.capture_mode, sizeof(decision.capture_mode), "trigger_window");
         snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "after_unexpected_kernel");
+    } else if (g_collection_mode == COLLECTION_SELECTIVE &&
+               kernel_should_full_time_selective(kernel_name)) {
+        decision.full_timing = 1;
+        snprintf(decision.capture_mode, sizeof(decision.capture_mode), "selective_full");
+        snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "selective_important_kernel");
     } else {
         decision.full_timing = 0;
-        snprintf(decision.capture_mode, sizeof(decision.capture_mode), "name_only");
-        snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "matched_expected_kernel");
+        snprintf(decision.capture_mode, sizeof(decision.capture_mode),
+                 g_collection_mode == COLLECTION_SELECTIVE ? "selective_name_only" : "name_only");
+        snprintf(decision.trigger_reason, sizeof(decision.trigger_reason),
+                 g_collection_mode == COLLECTION_SELECTIVE ? "selective_low_value_kernel" : "matched_expected_kernel");
     }
     pthread_mutex_unlock(&g_adaptive_lock);
     return decision;
@@ -2161,6 +2267,8 @@ static void init_runtime(void) {
     g_collection_mode = parse_collection_mode(getenv("WEAVER_COLLECTION_MODE"));
     g_trigger_capture_after = env_ulong("WEAVER_TRIGGER_CAPTURE_AFTER", 2UL);
     g_trigger_unknown = env_flag("WEAVER_TRIGGER_UNKNOWN_KERNELS", 0);
+    g_selective_timed_reduction = env_flag("WEAVER_SELECTIVE_TIMED_REDUCTION", 0);
+    g_selective_unknown_full = env_flag("WEAVER_SELECTIVE_UNKNOWN_FULL", 0);
     g_sequence_repeat = env_flag("WEAVER_SEQUENCE_REPEAT", 1);
     parse_expected_kernel_list(getenv("WEAVER_EXPECTED_KERNELS"), 0);
     parse_expected_kernel_list(getenv("WEAVER_EXPECTED_KERNEL_REGEX"), 1);
@@ -2187,7 +2295,7 @@ static void init_runtime(void) {
     }
 
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"collection_mode\":\"%s\",\"expected_kernel_patterns\":%lu,\"expected_sequence_nodes\":%lu,\"sequence_repeat\":%s,\"trigger_capture_after\":%lu,\"trigger_unknown_kernels\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"async_launch_emit\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"collection_mode\":\"%s\",\"expected_kernel_patterns\":%lu,\"expected_sequence_nodes\":%lu,\"sequence_repeat\":%s,\"trigger_capture_after\":%lu,\"trigger_unknown_kernels\":%s,\"selective_timed_reduction\":%s,\"selective_unknown_full\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"async_launch_emit\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
         now_ns(), getpid(), (unsigned long long)pthread_self(),
         g_rank, g_local_rank, g_world_size,
         g_rank, g_local_rank, g_world_size,
@@ -2201,6 +2309,8 @@ static void init_runtime(void) {
         g_sequence_repeat ? "true" : "false",
         g_trigger_capture_after,
         g_trigger_unknown ? "true" : "false",
+        g_selective_timed_reduction ? "true" : "false",
+        g_selective_unknown_full ? "true" : "false",
         g_patch_dlsym ? "true" : "false",
         g_patch_getproc ? "true" : "false",
         g_disasm_enabled ? "true" : "false",

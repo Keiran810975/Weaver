@@ -37,10 +37,12 @@ Useful environment knobs:
 - `WEAVER_PYTHON_EVENT_BUDGET`: stop and unload the CPython profile callback after N emitted Python events. The low-overhead launcher defaults to `1`; use `0` for an unlimited/full Python trace during deep diagnosis.
 - `WEAVER_TRACE_GC=0/1`: disable or enable Python GC pause events.
 - `WEAVER_ENABLE_DISASM=1`: opt into loaded GPU code capture and the Neutrino-style disassembly sidecar. Default is `0` for the low-overhead normal path.
-- `WEAVER_COLLECTION_MODE=adaptive_name`: record expected kernels by name only and enable CUDA Event timing only when an unexpected kernel name triggers a local capture window. Use `full` for the older all-kernel timing path, or `name_only` for names only.
+- `WEAVER_COLLECTION_MODE=selective`: record GEMM/NCCL/memcpy/layout kernels with CUDA Event GPU start/end, while high-frequency low-value kernels stay name-only. Use `adaptive_name` for sketch-triggered timing windows, `full` for the older all-kernel timing path, or `name_only` for names only.
+- `WEAVER_SELECTIVE_TIMED_REDUCTION=1`: in selective mode, also time reduction/norm/softmax-style kernels. Default is name-only for lower overhead.
+- `WEAVER_SELECTIVE_UNKNOWN_FULL=1`: in selective mode, time unknown/runtime kernels. Default is name-only because these are often short and frequent.
 - `WEAVER_EXPECTED_KERNELS`: semicolon/comma-separated expected kernel patterns. Prefix entries with `exact:` or `regex:` when needed; unprefixed entries are substring matches.
 - `WEAVER_TRIGGER_CAPTURE_AFTER=2`: after an unexpected kernel, collect this many following launches with full CUDA Event timing to catch the next/overlap neighborhood.
-- `WEAVER_CUDA_EVENTS=1`: keep CUDA Event support available for triggered windows. In adaptive mode, expected kernels do not get CUDA Events on the normal path.
+- `WEAVER_CUDA_EVENTS=1`: keep CUDA Event support available for selective timing and triggered windows.
 - `WEAVER_CUDA_EVENT_POOL=1`: reuse CUDA Event pairs across launches to avoid per-launch create/destroy overhead.
 - `WEAVER_CUDA_SYNC_ANCHOR=1`: synchronize a per-stream anchor to align CUDA Event times onto host time. Default is `1`.
 
@@ -84,7 +86,7 @@ python your_training.py
 
 The hook emits online events for:
 - `cuModuleGetFunction` (kernel symbol mapping)
-- `cuLaunchKernel`, `cuLaunchKernelEx`, and their `_ptsz` variants. Adaptive mode emits expected launches as name-only records; triggered/full mode adds CUDA Event GPU duration, grid/block/shared mem, and warp/block counts.
+- `cuLaunchKernel`, `cuLaunchKernelEx`, and their `_ptsz` variants. Selective mode times GEMM/NCCL/memcpy/layout kernels and emits low-value launches as name-only records; triggered/full mode adds CUDA Event GPU duration, grid/block/shared mem, and warp/block counts.
 - `cudaLaunchKernel`, `cudaLaunchKernelExC`, `cudaLaunchCooperativeKernel`, and their `_ptsz` variants for CUDA Runtime API launches
 - `cuGetProcAddress`/`cuGetProcAddress_v2` so libraries that resolve CUDA driver symbols dynamically still route through the hook
 - `cuFuncGetName` fallback naming for driver kernels when module/function name mapping is unavailable
@@ -189,9 +191,9 @@ PYTHONPATH=. python examples/run_overhead_experiment.py \
 	--output-dir ./overhead_v100_quick
 ```
 
-The quick preset is sized for a 2xV100 node and should finish in roughly five minutes or less. It compares the same workload without collection, with Weaver's adaptive name-only normal path, and with `torch_profiler` as a reference. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
+The quick preset is sized for a 2xV100 node and should finish in roughly five minutes or less. It compares the same workload without collection, with Weaver's selective low-overhead normal path, and with `torch_profiler` as a reference. Details are in [examples/OVERHEAD_EXPERIMENT.md](examples/OVERHEAD_EXPERIMENT.md).
 
-Use `--collection-mode full` only to measure the older all-kernel CUDA Event path. The default overhead claim should use adaptive mode.
+Use `--collection-mode full` only to measure the older all-kernel CUDA Event path. The default overhead claim should use selective mode.
 
 ## Event schema (high-level)
 

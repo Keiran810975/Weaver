@@ -16,7 +16,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD = ROOT / "examples" / "overhead_workload.py"
 HOOK = ROOT / "hooks" / "libweaver_hook.so"
-RUNNER_VERSION = "full_kernel_timing_slowdown_v1"
+RUNNER_VERSION = "selective_kernel_timing_slowdown_v1"
 
 PRESETS = {
     "single_gpu_quick": {
@@ -36,7 +36,7 @@ PRESETS = {
         "profiler_active": 5,
         "python_sample_rate": 1,
         "python_event_budget": 1,
-        "collection_mode": "full",
+        "collection_mode": "selective",
     },
     "quick": {
         "output_dir": "./overhead_v100_quick",
@@ -54,7 +54,7 @@ PRESETS = {
         "profiler_active": 5,
         "python_sample_rate": 1,
         "python_event_budget": 1,
-        "collection_mode": "full",
+        "collection_mode": "selective",
     },
     "paper": {
         "output_dir": "./overhead_out",
@@ -72,7 +72,7 @@ PRESETS = {
         "profiler_active": 10,
         "python_sample_rate": 1,
         "python_event_budget": 1,
-        "collection_mode": "full",
+        "collection_mode": "selective",
     },
 }
 
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument(
         "--collection-mode",
-        choices=["adaptive_name", "name_only", "full"],
+        choices=["selective", "adaptive_name", "name_only", "full"],
         default=None,
         help="Weaver CUDA hook collection mode used by hook-enabled modes",
     )
@@ -140,7 +140,7 @@ def parse_args() -> argparse.Namespace:
         "--trigger-capture-after",
         type=int,
         default=int(os.environ.get("WEAVER_TRIGGER_CAPTURE_AFTER", "2")),
-        help="adaptive mode: number of launches after an unexpected kernel to time with CUDA Events",
+        help="adaptive/selective mode: number of launches after an unexpected kernel to time with CUDA Events",
     )
     parser.add_argument("--skip-hook-build", action="store_true")
     parser.add_argument("--skip-native-build", action="store_true")
@@ -155,7 +155,7 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
         if getattr(args, key) is None:
             setattr(args, key, value)
     if args.collection_mode is None:
-        args.collection_mode = os.environ.get("WEAVER_COLLECTION_MODE", "full")
+        args.collection_mode = os.environ.get("WEAVER_COLLECTION_MODE", "selective")
     if args.single_gpu is None:
         args.single_gpu = False
 
@@ -471,7 +471,7 @@ def validate_weaver_event_coverage(mode: str, events: Dict[str, object], log_pat
                 if tail:
                     detail += f"\n--- torchrun.log tail ---\n{tail}"
                 raise RuntimeError(detail)
-            if args.collection_mode == "full" and int(events.get("timed_kernel_launches", 0)) <= 0:
+            if args.collection_mode in {"full", "selective"} and int(events.get("timed_kernel_launches", 0)) <= 0:
                 tail = read_log_tail(log_path)
                 detail = (
                     f"{mode} produced no CUDA Event timed kernel_launch events; "
@@ -1004,9 +1004,9 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
         "runner_path": str(Path(__file__).resolve()),
         "method": {
             "preset": args.preset,
-            "baseline": "same dual-GPU workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
-            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; full CUDA hook mode records GPU start/end for every CUDA kernel launch with CUDA Events",
-            "steady_state": "warmup iterations are excluded from step-level overhead; kernel slowdown uses all timed kernel_launch events written by the hook",
+            "baseline": "same workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
+            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; the default selective CUDA hook records GPU start/end for diagnostic-critical kernels and records low-value kernels by name only",
+            "steady_state": "warmup iterations are excluded from step-level overhead; kernel slowdown uses timed kernel_launch events written by the hook",
             "primary_metric": "median host_step_ms overhead vs baseline",
             "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes", "per_kernel_gpu_duration_slowdown"],
             "per_kernel_slowdown": (
@@ -1056,7 +1056,7 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "",
         "Interpretation:",
         "- The main claim should use `weaver_full` host median overhead versus `baseline`.",
-        "- Default Weaver modes now use full CUDA Event timing for every kernel launch.",
+        "- Default Weaver modes use selective CUDA Event timing: GEMM/NCCL/memcpy/layout kernels are timed, while low-value high-frequency kernels are name-only.",
         "- Per-kernel slowdown is written to `kernel_slowdown.json` and `kernel_slowdown.md`.",
         "- `torch_profiler` is a reference diagnostic tool; the normal Weaver path should be below it.",
     ]

@@ -491,9 +491,9 @@ def main() -> int:
     parser.add_argument("--copy-mb", type=int, default=16)
     parser.add_argument(
         "--anomaly-collection-mode",
-        choices=["adaptive_name", "name_only", "full"],
-        default="full",
-        help="collection mode for injected anomaly diagnosis runs; full is the robust default",
+        choices=["selective", "adaptive_name", "name_only", "full"],
+        default="selective",
+        help="collection mode for injected anomaly diagnosis runs; selective is the low-overhead default",
     )
     parser.add_argument("--trigger-capture-after", type=int, default=2)
     parser.add_argument("--timeout-s", type=int, default=300)
