@@ -67,7 +67,7 @@ class OverheadModel(nn.Module):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Dual-GPU workload for Weaver overhead experiments")
+    parser = argparse.ArgumentParser(description="GPU workload for Weaver overhead experiments")
     parser.add_argument("--run-mode", default=os.environ.get("WEAVER_OVERHEAD_MODE", "baseline"))
     parser.add_argument("--repetition", type=int, default=int(os.environ.get("WEAVER_OVERHEAD_REP", "0")))
     parser.add_argument("--output-dir", required=True)
@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=2048)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--explicit-comm-mb", type=int, default=16)
+    parser.add_argument(
+        "--single-gpu",
+        action="store_true",
+        help="run without torch.distributed/DDP/NCCL; used by the single-card overhead preset",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--torch-profiler", action="store_true")
@@ -104,13 +109,16 @@ def is_profiler_active_step(args: argparse.Namespace, iteration: int) -> bool:
     return active_start <= iteration < active_end
 
 
-def setup_dist() -> None:
+def setup_runtime(args: argparse.Namespace) -> None:
     if dist.is_initialized():
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("This overhead workload is intentionally GPU-only")
+    if args.single_gpu:
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
         return
     if "RANK" not in os.environ:
         raise RuntimeError("Run this script with torchrun so RANK/WORLD_SIZE are set")
-    if not torch.cuda.is_available():
-        raise RuntimeError("This overhead workload is intentionally GPU-only")
     dist.init_process_group(backend="nccl")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
@@ -175,11 +183,11 @@ def make_targets(args: argparse.Namespace, device: torch.device) -> torch.Tensor
     return torch.randn(args.batch_size, args.seq_len, args.dim, device=device)
 
 
-def explicit_all_reduce(buffer: torch.Tensor) -> int:
+def explicit_all_reduce(buffer: Optional[torch.Tensor]) -> int:
+    if buffer is None or world_size() <= 1 or not dist.is_initialized():
+        return 0
     dist.all_reduce(buffer, op=dist.ReduceOp.SUM)
     per_rank = buffer.numel() * buffer.element_size()
-    if world_size() <= 1:
-        return per_rank
     return int(per_rank * 2 * (world_size() - 1) / world_size())
 
 
@@ -188,7 +196,7 @@ def overhead_train_step(
     optimizer: torch.optim.Optimizer,
     x: torch.Tensor,
     y: torch.Tensor,
-    comm_buffer: torch.Tensor,
+    comm_buffer: Optional[torch.Tensor],
 ) -> Dict[str, float]:
     stream = torch.cuda.current_stream()
     optimizer.zero_grad(set_to_none=True)
@@ -209,12 +217,16 @@ def overhead_train_step(
 
     backward_ms = timed_region(_backward, stream)
 
-    def _explicit_comm():
-        with torch.profiler.record_function("weaver_overhead_explicit_all_reduce"):
-            holder["comm_bytes"] = torch.tensor(explicit_all_reduce(comm_buffer), device=x.device)
+    if comm_buffer is not None:
+        def _explicit_comm():
+            with torch.profiler.record_function("weaver_overhead_explicit_all_reduce"):
+                holder["comm_bytes"] = torch.tensor(explicit_all_reduce(comm_buffer), device=x.device)
 
-    explicit_comm_ms = timed_region(_explicit_comm, stream)
-    explicit_comm_bytes = int(holder["comm_bytes"].item())
+        explicit_comm_ms = timed_region(_explicit_comm, stream)
+        explicit_comm_bytes = int(holder["comm_bytes"].item())
+    else:
+        explicit_comm_ms = 0.0
+        explicit_comm_bytes = 0
 
     def _optimizer():
         with torch.profiler.record_function("weaver_overhead_optimizer"):
@@ -264,7 +276,7 @@ def profiler_context(args: argparse.Namespace, output_dir: Path):
 def main() -> None:
     args = parse_args()
     normalize_profiler_args(args)
-    setup_dist()
+    setup_runtime(args)
 
     r = rank()
     lr = local_rank()
@@ -277,12 +289,15 @@ def main() -> None:
     device = torch.device("cuda", lr)
 
     model = OverheadModel(args.dim, args.hidden_dim, args.layers).to(device)
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[lr], output_device=lr)
+    if not args.single_gpu:
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[lr], output_device=lr)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     x = make_inputs(args, device)
     y = make_targets(args, device)
-    comm_elems = max(1, (args.explicit_comm_mb * 1024 * 1024) // 4)
-    comm_buffer = torch.randn(comm_elems, device=device)
+    comm_buffer = None
+    if args.explicit_comm_mb > 0 and not args.single_gpu and world_size() > 1:
+        comm_elems = max(1, (args.explicit_comm_mb * 1024 * 1024) // 4)
+        comm_buffer = torch.randn(comm_elems, device=device)
 
     metadata = {
         "run_mode": args.run_mode,
@@ -300,6 +315,7 @@ def main() -> None:
             "hidden_dim": args.hidden_dim,
             "layers": args.layers,
             "explicit_comm_mb": args.explicit_comm_mb,
+            "single_gpu": args.single_gpu,
             "warmup": args.warmup,
             "iters": args.iters,
             "profiler_active": args.profiler_active,

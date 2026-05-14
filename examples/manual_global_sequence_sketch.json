@@ -1,0 +1,82 @@
+{
+  "metadata": {
+    "schema_version": "0.3",
+    "source": "manual",
+    "mode": "global_sequence",
+    "description": "Example hand-written expected kernel sequence. Streams are logical labels emitted by Weaver as stream_label=s0/s1 per rank."
+  },
+  "execution_nodes": [
+    {
+      "node_id": "rank0.s0.forward.gemm_0",
+      "rank": 0,
+      "stream": "s0",
+      "phase": "forward",
+      "family": "GEMM",
+      "match": {
+        "kernel_name_regex": ".*(gemm|matmul|cutlass|cublas).*"
+      }
+    },
+    {
+      "node_id": "rank0.s0.backward.gemm_0",
+      "rank": 0,
+      "stream": "s0",
+      "phase": "backward",
+      "family": "GEMM",
+      "match": {
+        "kernel_name_regex": ".*(gemm|matmul|cutlass|cublas).*"
+      }
+    },
+    {
+      "node_id": "rank0.s1.backward.nccl_allreduce_0",
+      "rank": 0,
+      "stream": "s1",
+      "phase": "backward_comm",
+      "family": "NCCL",
+      "match": {
+        "kernel_name_regex": ".*(nccl|allreduce|all_reduce).*"
+      }
+    },
+    {
+      "node_id": "rank1.s0.forward.gemm_0",
+      "rank": 1,
+      "stream": "s0",
+      "phase": "forward",
+      "family": "GEMM",
+      "match": {
+        "kernel_name_regex": ".*(gemm|matmul|cutlass|cublas).*"
+      }
+    },
+    {
+      "node_id": "rank1.s0.backward.gemm_0",
+      "rank": 1,
+      "stream": "s0",
+      "phase": "backward",
+      "family": "GEMM",
+      "match": {
+        "kernel_name_regex": ".*(gemm|matmul|cutlass|cublas).*"
+      }
+    },
+    {
+      "node_id": "rank1.s1.backward.nccl_allreduce_0",
+      "rank": 1,
+      "stream": "s1",
+      "phase": "backward_comm",
+      "family": "NCCL",
+      "match": {
+        "kernel_name_regex": ".*(nccl|allreduce|all_reduce).*"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "rank0.s0.backward.gemm_0",
+      "to": "rank0.s1.backward.nccl_allreduce_0",
+      "type": "may_overlap"
+    },
+    {
+      "from": "rank1.s0.backward.gemm_0",
+      "to": "rank1.s1.backward.nccl_allreduce_0",
+      "type": "may_overlap"
+    }
+  ]
+}

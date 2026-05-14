@@ -28,6 +28,14 @@ FAMILY_KERNEL_PATTERNS = {
 }
 
 
+def _family_regex(family: str) -> str:
+    patterns = FAMILY_KERNEL_PATTERNS.get(str(family).strip().upper(), [])
+    if not patterns:
+        return ".*"
+    escaped = "|".join(patterns)
+    return f"regex:.*({escaped}).*"
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -116,6 +124,48 @@ def _expected_patterns_from_sketch(path: Optional[str]) -> List[str]:
     return deduped
 
 
+def _node_match_pattern(node: dict) -> str:
+    match = node.get("match") or {}
+    if match.get("kernel_name_regex"):
+        return f"regex:{match['kernel_name_regex']}"
+    if match.get("name_regex"):
+        return f"regex:{match['name_regex']}"
+    if match.get("kernel_name"):
+        return f"exact:{match['kernel_name']}"
+    if match.get("kernel_name_contains"):
+        return str(match["kernel_name_contains"])
+    if match.get("kernel_name_substr"):
+        return str(match["kernel_name_substr"])
+    if node.get("family"):
+        return _family_regex(str(node["family"]))
+    return "regex:.*"
+
+
+def _expected_sequence_from_sketch(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    sketch_path = Path(path).expanduser().resolve()
+    data = json.loads(sketch_path.read_text(encoding="utf-8"))
+    nodes = data.get("execution_nodes") or []
+    if not nodes:
+        return []
+
+    per_lane_ordinals = {}
+    lines: List[str] = []
+    for index, node in enumerate(nodes):
+        rank = str(node.get("rank", "*"))
+        stream = str(node.get("stream", node.get("stream_label", "*")))
+        lane = (rank, stream)
+        ordinal = node.get("stream_ordinal")
+        if ordinal is None:
+            ordinal = per_lane_ordinals.get(lane, 0)
+        per_lane_ordinals[lane] = max(per_lane_ordinals.get(lane, 0), int(ordinal) + 1)
+        node_id = str(node.get("node_id") or node.get("id") or f"node_{index}")
+        pattern = _node_match_pattern(node)
+        lines.append(f"{rank}\t{stream}\t{int(ordinal)}\t{node_id}\t{pattern}")
+    return lines
+
+
 def _start_daemon(args) -> subprocess.Popen:
     cmd = [
         sys.executable,
@@ -175,6 +225,9 @@ def _target_env(args) -> dict:
         patterns.extend([p.strip() for p in args.expected_kernels.split(",") if p.strip()])
     if patterns:
         env["WEAVER_EXPECTED_KERNELS"] = ";".join(patterns)
+    sequence = _expected_sequence_from_sketch(args.sketch)
+    if sequence:
+        env["WEAVER_EXPECTED_SEQUENCE"] = "\n".join(sequence)
     env.setdefault("WEAVER_CUDA_EVENTS", "1")
     env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
     env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", "1")

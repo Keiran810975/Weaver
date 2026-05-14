@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import json
 import os
 import signal
@@ -9,15 +10,34 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD = ROOT / "examples" / "overhead_workload.py"
 HOOK = ROOT / "hooks" / "libweaver_hook.so"
-RUNNER_VERSION = "adaptive_name_capture_v1"
+RUNNER_VERSION = "full_kernel_timing_slowdown_v1"
 
 PRESETS = {
+    "single_gpu_quick": {
+        "output_dir": "./overhead_single_gpu_quick",
+        "modes": "baseline,weaver_full,torch_profiler",
+        "repeats": 1,
+        "nproc_per_node": 1,
+        "single_gpu": True,
+        "warmup": 5,
+        "iters": 20,
+        "batch_size": 4,
+        "seq_len": 256,
+        "dim": 512,
+        "hidden_dim": 2048,
+        "layers": 3,
+        "explicit_comm_mb": 0,
+        "profiler_active": 5,
+        "python_sample_rate": 1,
+        "python_event_budget": 1,
+        "collection_mode": "full",
+    },
     "quick": {
         "output_dir": "./overhead_v100_quick",
         "modes": "baseline,weaver_full,torch_profiler",
@@ -34,6 +54,7 @@ PRESETS = {
         "profiler_active": 5,
         "python_sample_rate": 1,
         "python_event_budget": 1,
+        "collection_mode": "full",
     },
     "paper": {
         "output_dir": "./overhead_out",
@@ -51,6 +72,7 @@ PRESETS = {
         "profiler_active": 10,
         "python_sample_rate": 1,
         "python_event_budget": 1,
+        "collection_mode": "full",
     },
 }
 
@@ -67,6 +89,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--modes")
     parser.add_argument("--repeats", type=int)
     parser.add_argument("--nproc-per-node", type=int)
+    parser.add_argument(
+        "--single-gpu",
+        action="store_true",
+        default=None,
+        help="run workload directly on one GPU without torch.distributed/DDP/NCCL",
+    )
     parser.add_argument("--warmup", type=int)
     parser.add_argument("--iters", type=int)
     parser.add_argument("--batch-size", type=int)
@@ -94,8 +122,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--collection-mode",
         choices=["adaptive_name", "name_only", "full"],
-        default=os.environ.get("WEAVER_COLLECTION_MODE", "adaptive_name"),
+        default=None,
         help="Weaver CUDA hook collection mode used by hook-enabled modes",
+    )
+    parser.add_argument(
+        "--kernel-slowdown-target-mode",
+        default="weaver_full",
+        help="Weaver mode whose per-kernel CUDA Event timings are compared against the reference trace",
+    )
+    parser.add_argument(
+        "--kernel-slowdown-topk",
+        type=int,
+        default=50,
+        help="maximum number of exact kernel rows written to kernel_slowdown.md",
     )
     parser.add_argument(
         "--trigger-capture-after",
@@ -115,6 +154,10 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
     for key, value in preset.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
+    if args.collection_mode is None:
+        args.collection_mode = os.environ.get("WEAVER_COLLECTION_MODE", "full")
+    if args.single_gpu is None:
+        args.single_gpu = False
 
 
 def percentile(values: List[float], pct: float) -> float:
@@ -232,11 +275,16 @@ def mode_env(
     python_event_budget: int,
     collection_mode: str,
     trigger_capture_after: int,
+    single_gpu: bool,
 ) -> Dict[str, str]:
     env = os.environ.copy()
     prepend_path(env, "PYTHONPATH", str(ROOT))
     env["WEAVER_OVERHEAD_MODE"] = mode
     env["WEAVER_OVERHEAD_REP"] = str(rep)
+    if single_gpu:
+        env["RANK"] = "0"
+        env["LOCAL_RANK"] = "0"
+        env["WORLD_SIZE"] = "1"
 
     # Avoid NCCL init failures observed with LD_PRELOAD hooks on some systems.
     env.setdefault("NCCL_P2P_DISABLE", "1")
@@ -259,8 +307,8 @@ def mode_env(
 
     if needs_hook(mode):
         add_preload(env, HOOK)
-        env.setdefault("WEAVER_COLLECTION_MODE", collection_mode)
-        env.setdefault("WEAVER_TRIGGER_CAPTURE_AFTER", str(max(0, trigger_capture_after)))
+        env["WEAVER_COLLECTION_MODE"] = collection_mode
+        env["WEAVER_TRIGGER_CAPTURE_AFTER"] = str(max(0, trigger_capture_after))
         env.setdefault("WEAVER_CUDA_EVENTS", "1")
         env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
         env.setdefault("WEAVER_CUDA_EVENT_POOL", "1")
@@ -276,37 +324,44 @@ def mode_env(
 
 
 def workload_cmd(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> List[str]:
-    cmd = [
-        args.python,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc_per_node",
-        str(args.nproc_per_node),
-        str(WORKLOAD),
-        "--run-mode",
-        mode,
-        "--repetition",
-        str(rep),
-        "--output-dir",
-        str(out_dir),
-        "--warmup",
-        str(args.warmup),
-        "--iters",
-        str(args.iters),
-        "--batch-size",
-        str(args.batch_size),
-        "--seq-len",
-        str(args.seq_len),
-        "--dim",
-        str(args.dim),
-        "--hidden-dim",
-        str(args.hidden_dim),
-        "--layers",
-        str(args.layers),
-        "--explicit-comm-mb",
-        str(args.explicit_comm_mb),
-    ]
+    if args.single_gpu:
+        cmd = [args.python, str(WORKLOAD), "--single-gpu"]
+    else:
+        cmd = [
+            args.python,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node",
+            str(args.nproc_per_node),
+            str(WORKLOAD),
+        ]
+    cmd.extend(
+        [
+            "--run-mode",
+            mode,
+            "--repetition",
+            str(rep),
+            "--output-dir",
+            str(out_dir),
+            "--warmup",
+            str(args.warmup),
+            "--iters",
+            str(args.iters),
+            "--batch-size",
+            str(args.batch_size),
+            "--seq-len",
+            str(args.seq_len),
+            "--dim",
+            str(args.dim),
+            "--hidden-dim",
+            str(args.hidden_dim),
+            "--layers",
+            str(args.layers),
+            "--explicit-comm-mb",
+            str(args.explicit_comm_mb),
+        ]
+    )
     if mode == "torch_profiler":
         cmd.append("--torch-profiler")
         cmd.extend(["--profiler-active", str(args.profiler_active)])
@@ -457,6 +512,7 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
             args.python_event_budget,
             args.collection_mode,
             args.trigger_capture_after,
+            args.single_gpu,
         )
         cmd = workload_cmd(args, mode, rep, out_dir)
         log_path = run_dir / "torchrun.log"
@@ -539,6 +595,374 @@ def percent_delta(value: float, baseline: float) -> float:
     return (value - baseline) / baseline * 100.0
 
 
+def safe_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def canonical_kernel_name(value: object) -> str:
+    text = str(value or "<unknown>").strip()
+    return text if text else "<unknown>"
+
+
+def classify_kernel_family(kernel_name: str) -> str:
+    name = kernel_name.lower()
+    if "nccl" in name or "allreduce" in name or "all_reduce" in name:
+        return "Communication"
+    if (
+        "gemm" in name
+        or "sgemm" in name
+        or "hgemm" in name
+        or "cublas" in name
+        or "matmul" in name
+        or "cutlass" in name
+    ):
+        return "Compute-Matrix"
+    if (
+        "memcpy" in name
+        or "copy" in name
+        or "transpose" in name
+        or "permute" in name
+        or "contiguous" in name
+        or "cat" in name
+    ):
+        return "Memory-Copy/Layout"
+    if (
+        "reduce" in name
+        or "reduction" in name
+        or "softmax" in name
+        or "norm" in name
+        or "sum" in name
+        or "layer_norm" in name
+    ):
+        return "Reduction"
+    return "Other/Unknown"
+
+
+def load_weaver_kernel_durations_us(out_dir: Path, mode: str) -> Dict[str, List[float]]:
+    durations: Dict[str, List[float]] = {}
+    for path in sorted((out_dir / mode).glob("rep_*/weaver_events.ndjson")):
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("kind") != "kernel_launch":
+                    continue
+                payload = event.get("payload") or {}
+                if payload.get("cuda_event_timing") is not True:
+                    continue
+                duration_ns = safe_float(payload.get("gpu_duration_ns"))
+                if duration_ns is None:
+                    duration_ns = safe_float(event.get("dur_ns"))
+                if duration_ns is None or duration_ns <= 0:
+                    continue
+                name = canonical_kernel_name(
+                    event.get("kernel_name") or payload.get("kernel_name") or payload.get("kernel")
+                )
+                durations.setdefault(name, []).append(duration_ns / 1000.0)
+    return durations
+
+
+def torch_profiler_trace_paths(out_dir: Path, mode: str) -> List[Path]:
+    patterns = [
+        f"{mode}/rep_*/rank_*/torch_profiler/rank_*/*.pt.trace.json",
+        f"{mode}/rep_*/rank_*/torch_profiler/rank_*/*.pt.trace.json.gz",
+        f"{mode}/rep_*/rank_*/torch_profiler/rank_*/*.json",
+        f"{mode}/rep_*/rank_*/torch_profiler/rank_*/*.json.gz",
+    ]
+    seen = set()
+    paths: List[Path] = []
+    for pattern in patterns:
+        for path in sorted(out_dir.glob(pattern)):
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def load_trace_json(path: Path) -> Dict[str, object]:
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            return json.load(f)
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        return json.load(f)
+
+
+def is_torch_profiler_kernel_event(event: Dict[str, object]) -> bool:
+    if event.get("ph") not in (None, "X"):
+        return False
+    category = str(event.get("cat", "")).lower()
+    if "kernel" not in category:
+        return False
+    duration_us = safe_float(event.get("dur"))
+    if duration_us is None or duration_us <= 0:
+        return False
+    name = canonical_kernel_name(event.get("name"))
+    if name == "<unknown>":
+        return False
+    return True
+
+
+def load_torch_profiler_kernel_durations_us(out_dir: Path, mode: str = "torch_profiler") -> Tuple[Dict[str, List[float]], List[str]]:
+    durations: Dict[str, List[float]] = {}
+    warnings: List[str] = []
+    paths = torch_profiler_trace_paths(out_dir, mode)
+    if not paths:
+        return durations, [f"no torch profiler trace files found under {out_dir / mode}"]
+    for path in paths:
+        try:
+            trace = load_trace_json(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.append(f"failed to read {path}: {exc}")
+            continue
+        events = trace.get("traceEvents")
+        if not isinstance(events, list):
+            warnings.append(f"{path} has no traceEvents array")
+            continue
+        for event in events:
+            if not isinstance(event, dict) or not is_torch_profiler_kernel_event(event):
+                continue
+            duration_us = safe_float(event.get("dur"))
+            if duration_us is None:
+                continue
+            name = canonical_kernel_name(event.get("name"))
+            durations.setdefault(name, []).append(duration_us)
+    return durations, warnings
+
+
+def merge_by_family(durations_by_name: Dict[str, List[float]]) -> Dict[str, List[float]]:
+    by_family: Dict[str, List[float]] = {}
+    for name, values in durations_by_name.items():
+        by_family.setdefault(classify_kernel_family(name), []).extend(values)
+    return by_family
+
+
+def slowdown_severity(slowdown_pct: Optional[float]) -> str:
+    if slowdown_pct is None:
+        return "unavailable"
+    if slowdown_pct < -5.0:
+        return "faster"
+    if slowdown_pct <= 5.0:
+        return "low"
+    if slowdown_pct <= 15.0:
+        return "moderate"
+    return "high"
+
+
+def duration_comparison_row(
+    name: str,
+    before_values: Optional[List[float]],
+    after_values: Optional[List[float]],
+    name_field: str,
+) -> Dict[str, object]:
+    before_values = before_values or []
+    after_values = after_values or []
+    before = summarize(before_values)
+    after = summarize(after_values)
+    before_median = before["median"]
+    after_median = after["median"]
+    available = bool(before_values) and bool(after_values) and before_median > 0
+    slowdown_pct: Optional[float]
+    slowdown_factor: Optional[float]
+    if available:
+        slowdown_pct = percent_delta(after_median, before_median)
+        slowdown_factor = after_median / before_median
+        delta_us: Optional[float] = after_median - before_median
+    else:
+        slowdown_pct = None
+        slowdown_factor = None
+        delta_us = None
+    row = {
+        name_field: name,
+        "family": classify_kernel_family(name) if name_field == "kernel_name" else name,
+        "comparison_available": available,
+        "before_gpu_us": before,
+        "after_weaver_gpu_us": after,
+        "delta_gpu_us_median": delta_us,
+        "before_count": len(before_values),
+        "after_count": len(after_values),
+        "slowdown_pct_median": slowdown_pct,
+        "slowdown_factor_median": slowdown_factor,
+        "severity": slowdown_severity(slowdown_pct),
+    }
+    if not available:
+        if not before_values:
+            row["unavailable_reason"] = "missing_reference_kernel_duration"
+        elif not after_values:
+            row["unavailable_reason"] = "missing_weaver_kernel_duration"
+        else:
+            row["unavailable_reason"] = "zero_reference_duration"
+    return row
+
+
+def build_kernel_slowdown_summary(out_dir: Path, modes: List[str], args: argparse.Namespace) -> Dict[str, object]:
+    target_mode = args.kernel_slowdown_target_mode
+    reference_mode = "torch_profiler" if "torch_profiler" in modes else ""
+    result: Dict[str, object] = {
+        "available": False,
+        "reference_mode": reference_mode,
+        "reference_source": "torch_profiler_cuda_kernel_trace" if reference_mode else "",
+        "target_mode": target_mode,
+        "target_source": "weaver_cuda_event_timed_kernel_launch",
+        "unit": "microseconds",
+        "note": (
+            "baseline mode has no per-kernel durations; step-level overhead is still measured "
+            "against baseline, while per-kernel slowdown uses the torch_profiler CUDA kernel "
+            "trace as the before/reference source."
+        ),
+        "warnings": [],
+        "by_kernel": [],
+        "by_family": [],
+    }
+    if target_mode not in modes:
+        result["reason"] = f"target mode {target_mode!r} was not run"
+        return result
+    if not reference_mode:
+        result["reason"] = "torch_profiler mode was not run, so no per-kernel reference durations are available"
+        return result
+
+    reference, warnings = load_torch_profiler_kernel_durations_us(out_dir, reference_mode)
+    target = load_weaver_kernel_durations_us(out_dir, target_mode)
+    result["warnings"] = warnings
+    result["reference_kernel_count"] = len(reference)
+    result["reference_sample_count"] = sum(len(v) for v in reference.values())
+    result["target_kernel_count"] = len(target)
+    result["target_sample_count"] = sum(len(v) for v in target.values())
+    if not reference:
+        result["reason"] = "no CUDA kernel durations were found in the torch_profiler trace"
+        return result
+    if not target:
+        result["reason"] = f"no CUDA Event timed kernel_launch events were found in {target_mode}"
+        return result
+
+    names = sorted(target.keys())
+    kernel_rows = [
+        duration_comparison_row(name, reference.get(name), target.get(name), "kernel_name")
+        for name in names
+    ]
+    family_names = sorted(set(merge_by_family(reference)) | set(merge_by_family(target)))
+    reference_family = merge_by_family(reference)
+    target_family = merge_by_family(target)
+    family_rows = [
+        duration_comparison_row(name, reference_family.get(name), target_family.get(name), "family")
+        for name in family_names
+    ]
+    available_rows = [r for r in kernel_rows if r["comparison_available"]]
+    result.update(
+        {
+            "available": bool(available_rows),
+            "matched_kernel_count": len(available_rows),
+            "unmatched_target_kernel_count": len(kernel_rows) - len(available_rows),
+            "by_kernel": sorted(
+                kernel_rows,
+                key=lambda row: (
+                    row["comparison_available"] is not True,
+                    -(row["slowdown_pct_median"] or 0.0),
+                    str(row.get("kernel_name", "")),
+                ),
+            ),
+            "by_family": sorted(
+                family_rows,
+                key=lambda row: (
+                    row["comparison_available"] is not True,
+                    -(row["slowdown_pct_median"] or 0.0),
+                    str(row.get("family", "")),
+                ),
+            ),
+        }
+    )
+    if not available_rows:
+        result["reason"] = (
+            "Weaver and torch_profiler both produced kernel durations, but exact kernel names did not match; "
+            "use by_family as a coarse fallback and check kernel name normalization."
+        )
+    return result
+
+
+def write_kernel_slowdown_files(out_dir: Path, slowdown: Dict[str, object], topk: int) -> None:
+    with (out_dir / "kernel_slowdown.json").open("w", encoding="utf-8") as f:
+        json.dump(slowdown, f, ensure_ascii=True, indent=2)
+
+    kernel_rows = slowdown.get("by_kernel") or []
+    family_rows = slowdown.get("by_family") or []
+    lines = [
+        "# Weaver Per-Kernel Slowdown",
+        "",
+        f"Reference: `{slowdown.get('reference_mode') or 'unavailable'}` ({slowdown.get('reference_source') or 'none'})",
+        f"Target: `{slowdown.get('target_mode')}` ({slowdown.get('target_source')})",
+        "",
+        str(slowdown.get("note", "")),
+        "",
+    ]
+    if not slowdown.get("available"):
+        lines.extend([
+            f"Status: unavailable. Reason: {slowdown.get('reason', 'unknown')}",
+            "",
+        ])
+    lines.extend([
+        "## By Family",
+        "",
+        "| family | before median us | after median us | delta us | slowdown | before n | after n | severity |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+    ])
+    for row in family_rows:
+        slowdown_pct = row.get("slowdown_pct_median")
+        slowdown_text = "n/a" if slowdown_pct is None else f"{slowdown_pct:+.2f}%"
+        delta = row.get("delta_gpu_us_median")
+        delta_text = "n/a" if delta is None else f"{delta:+.3f}"
+        lines.append(
+            "| {family} | {before:.3f} | {after:.3f} | {delta} | {slowdown} | {before_n} | {after_n} | {severity} |".format(
+                family=row.get("family", ""),
+                before=row["before_gpu_us"]["median"],
+                after=row["after_weaver_gpu_us"]["median"],
+                delta=delta_text,
+                slowdown=slowdown_text,
+                before_n=row.get("before_count", 0),
+                after_n=row.get("after_count", 0),
+                severity=row.get("severity", ""),
+            )
+        )
+    lines.extend([
+        "",
+        f"## By Exact Kernel (top {max(0, topk)})",
+        "",
+        "| kernel | family | before median us | after median us | delta us | slowdown | before n | after n | severity |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+    ])
+    for row in kernel_rows[: max(0, topk)]:
+        slowdown_pct = row.get("slowdown_pct_median")
+        slowdown_text = "n/a" if slowdown_pct is None else f"{slowdown_pct:+.2f}%"
+        delta = row.get("delta_gpu_us_median")
+        delta_text = "n/a" if delta is None else f"{delta:+.3f}"
+        lines.append(
+            "| {kernel} | {family} | {before:.3f} | {after:.3f} | {delta} | {slowdown} | {before_n} | {after_n} | {severity} |".format(
+                kernel=str(row.get("kernel_name", "")).replace("|", "\\|"),
+                family=row.get("family", ""),
+                before=row["before_gpu_us"]["median"],
+                after=row["after_weaver_gpu_us"]["median"],
+                delta=delta_text,
+                slowdown=slowdown_text,
+                before_n=row.get("before_count", 0),
+                after_n=row.get("after_count", 0),
+                severity=row.get("severity", ""),
+            )
+        )
+    if slowdown.get("warnings"):
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in slowdown["warnings"])
+    (out_dir / "kernel_slowdown.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run_results: List[Dict[str, object]]) -> Dict[str, object]:
     mode_summary: Dict[str, object] = {}
     for mode in modes:
@@ -573,6 +997,7 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
             "gpu_step_median_pct": percent_delta(gpu_median, baseline_gpu),
         }
 
+    kernel_slowdown = build_kernel_slowdown_summary(out_dir, modes, args)
     summary = {
         "experiment": "weaver_three_layer_collection_overhead",
         "runner_version": RUNNER_VERSION,
@@ -580,17 +1005,24 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
         "method": {
             "preset": args.preset,
             "baseline": "same dual-GPU workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
-            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; default CUDA hook mode is adaptive name-only with triggered CUDA Event windows",
-            "steady_state": "warmup iterations are excluded; adaptive mode records expected kernels by name and enables CUDA Event GPU timing only for triggered windows",
+            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; full CUDA hook mode records GPU start/end for every CUDA kernel launch with CUDA Events",
+            "steady_state": "warmup iterations are excluded from step-level overhead; kernel slowdown uses all timed kernel_launch events written by the hook",
             "primary_metric": "median host_step_ms overhead vs baseline",
-            "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes"],
+            "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes", "per_kernel_gpu_duration_slowdown"],
+            "per_kernel_slowdown": (
+                "baseline does not expose per-kernel durations, so exact per-kernel before/after "
+                "comparison uses torch_profiler CUDA kernel trace as the before/reference source "
+                "and Weaver CUDA Event timed kernel_launch events as the after/source under collection"
+            ),
         },
         "config": vars(args),
         "modes": mode_summary,
+        "kernel_slowdown_vs_reference": kernel_slowdown,
         "runs": run_results,
     }
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=True, indent=2)
+    write_kernel_slowdown_files(out_dir, kernel_slowdown, args.kernel_slowdown_topk)
     write_markdown(out_dir / "summary.md", summary, modes)
     return summary
 
@@ -616,6 +1048,7 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "# Weaver Overhead Experiment",
         "",
         "Warmup iterations are excluded from the steady-state overhead calculation.",
+        f"CUDA collection mode: `{summary['config'].get('collection_mode')}`.",
         "",
         "| mode | host median ms | GPU median ms | host overhead | GPU overhead | host p95 ms | Weaver events | Weaver MB |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -623,7 +1056,8 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "",
         "Interpretation:",
         "- The main claim should use `weaver_full` host median overhead versus `baseline`.",
-        "- Default Weaver modes use adaptive name-only collection and reserve CUDA Event timing for triggered windows.",
+        "- Default Weaver modes now use full CUDA Event timing for every kernel launch.",
+        "- Per-kernel slowdown is written to `kernel_slowdown.json` and `kernel_slowdown.md`.",
         "- `torch_profiler` is a reference diagnostic tool; the normal Weaver path should be below it.",
     ]
     path.write_text("\n".join(text), encoding="utf-8")
@@ -633,7 +1067,7 @@ def main() -> None:
     args = parse_args()
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    for stale_name in ("summary.json", "summary.md"):
+    for stale_name in ("summary.json", "summary.md", "kernel_slowdown.json", "kernel_slowdown.md"):
         stale_path = out_dir / stale_name
         if stale_path.exists():
             stale_path.unlink()
@@ -662,7 +1096,16 @@ def main() -> None:
             run_results.append(run_one(args, mode, rep, out_dir))
 
     summary = build_summary(out_dir, modes, args, run_results)
-    print(json.dumps({"summary": str(out_dir / "summary.json"), "modes": list(summary["modes"].keys())}, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "summary": str(out_dir / "summary.json"),
+                "kernel_slowdown": str(out_dir / "kernel_slowdown.json"),
+                "modes": list(summary["modes"].keys()),
+            },
+            ensure_ascii=True,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -88,12 +88,14 @@ typedef CUresult (*cuEventQuery_t)(CUevent);
 typedef CUresult (*cuEventSynchronize_t)(CUevent);
 typedef CUresult (*cuEventElapsedTime_t)(float*, CUevent, CUevent);
 typedef CUresult (*cuEventDestroy_t)(CUevent);
+typedef CUresult (*cuStreamWaitEvent_t)(CUstream, CUevent, unsigned int);
 typedef CUresult (*cuGetProcAddress_t)(const char*, void**, int, uint64_t, void*);
 typedef cudaError_t (*cudaLaunchKernel_runtime_t)(const void*, cuda_dim3, cuda_dim3,
                                                   void**, size_t, cudaStream_t);
 typedef cudaError_t (*cudaLaunchKernelExC_t)(const cudaLaunchConfig_runtime*, const void*, void**);
 typedef cudaError_t (*cudaLaunchCooperativeKernel_t)(const void*, cuda_dim3, cuda_dim3,
                                                      void**, size_t, cudaStream_t);
+typedef cudaError_t (*cudaStreamWaitEvent_t)(cudaStream_t, CUevent, unsigned int);
 
 typedef ncclResult_t (*ncclAllReduce_t)(const void*, void*, size_t,
                                         ncclDataType_t, ncclRedOp_t,
@@ -127,6 +129,8 @@ static cuEventQuery_t real_cuEventQuery = NULL;
 static cuEventSynchronize_t real_cuEventSynchronize = NULL;
 static cuEventElapsedTime_t real_cuEventElapsedTime = NULL;
 static cuEventDestroy_t real_cuEventDestroy = NULL;
+static cuStreamWaitEvent_t real_cuStreamWaitEvent = NULL;
+static cuStreamWaitEvent_t real_cuStreamWaitEvent_ptsz = NULL;
 static cuGetProcAddress_t real_cuGetProcAddress = NULL;
 static cuGetProcAddress_t real_cuGetProcAddress_v2 = NULL;
 static cudaLaunchKernel_runtime_t real_cudaLaunchKernel = NULL;
@@ -135,6 +139,8 @@ static cudaLaunchKernelExC_t real_cudaLaunchKernelExC = NULL;
 static cudaLaunchKernelExC_t real_cudaLaunchKernelExC_ptsz = NULL;
 static cudaLaunchCooperativeKernel_t real_cudaLaunchCooperativeKernel = NULL;
 static cudaLaunchCooperativeKernel_t real_cudaLaunchCooperativeKernel_ptsz = NULL;
+static cudaStreamWaitEvent_t real_cudaStreamWaitEvent = NULL;
+static cudaStreamWaitEvent_t real_cudaStreamWaitEvent_ptsz = NULL;
 
 static ncclAllReduce_t real_ncclAllReduce = NULL;
 static ncclAllGather_t real_ncclAllGather = NULL;
@@ -180,8 +186,39 @@ struct launch_capture_decision {
     int full_timing;
     int matched_expected;
     int triggered;
+    unsigned long stream_index;
+    unsigned long expected_ordinal;
+    unsigned long actual_ordinal;
     char capture_mode[32];
     char trigger_reason[64];
+    char stream_label[32];
+    char sketch_node_id[128];
+};
+
+struct stream_identity {
+    void* stream;
+    unsigned long index;
+    struct stream_identity* next;
+};
+
+struct expected_sequence_node {
+    int rank;
+    char stream_label[32];
+    unsigned long ordinal;
+    char* node_id;
+    char* pattern;
+    int is_regex;
+    int is_exact;
+    int regex_ready;
+    regex_t regex;
+    struct expected_sequence_node* next;
+};
+
+struct sequence_cursor {
+    char stream_label[32];
+    unsigned long expected_ordinal;
+    unsigned long actual_ordinal;
+    struct sequence_cursor* next;
 };
 
 struct code_item {
@@ -223,6 +260,9 @@ struct launch_item {
     char trigger_reason[64];
     int matched_expected;
     int adaptive_trigger;
+    unsigned long expected_ordinal;
+    unsigned long actual_ordinal;
+    char sketch_node_id[128];
     struct launch_item* next;
 };
 
@@ -246,6 +286,8 @@ struct launch_emit_record {
     long long poll_ready_ns;
     void* func;
     void* stream;
+    unsigned long stream_index;
+    char stream_label[32];
     unsigned long long launch_id;
     int ret;
     unsigned int grid[3];
@@ -258,10 +300,14 @@ struct launch_emit_record {
     char trigger_reason[64];
     int matched_expected;
     int adaptive_trigger;
+    unsigned long expected_ordinal;
+    unsigned long actual_ordinal;
+    char sketch_node_id[128];
 };
 
 static struct code_item* g_code_map = NULL;
 static struct stream_anchor* g_anchors = NULL;
+static struct stream_identity* g_stream_map = NULL;
 static struct launch_item* g_pending = NULL;
 static struct event_pair* g_event_pool = NULL;
 static struct launch_emit_record* g_launch_emit_queue = NULL;
@@ -276,13 +322,22 @@ static int g_launch_emit_started = 0;
 static int g_launch_emit_stop = 0;
 static enum collection_mode g_collection_mode = COLLECTION_ADAPTIVE_NAME;
 static struct expected_kernel_pattern* g_expected_kernels = NULL;
+static struct expected_sequence_node* g_expected_sequence = NULL;
+static struct sequence_cursor* g_sequence_cursors = NULL;
 static unsigned long g_expected_kernel_count = 0;
+static unsigned long g_expected_sequence_count = 0;
 static unsigned long g_trigger_capture_after = 2;
 static unsigned long g_trigger_window_remaining = 0;
 static int g_trigger_unknown = 0;
+static int g_sequence_repeat = 1;
+static int g_rank = -1;
+static int g_local_rank = -1;
+static int g_world_size = -1;
+static unsigned long g_stream_count = 0;
 static pthread_mutex_t g_adaptive_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int cuda_events_ready(void);
+static int kernel_name_is_unknown(const char* kernel_name);
 
 static long long now_ns(void) {
     struct timespec ts;
@@ -311,6 +366,88 @@ static unsigned long env_ulong(const char* name, unsigned long default_value) {
         return default_value;
     }
     return parsed;
+}
+
+static int env_int(const char* name, int default_value) {
+    const char* value = getenv(name);
+    if (!value || !value[0]) {
+        return default_value;
+    }
+    char* end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value) {
+        return default_value;
+    }
+    return (int)parsed;
+}
+
+static unsigned long stream_index_for(void* stream) {
+    pthread_mutex_lock(&g_map_lock);
+    struct stream_identity* cur = g_stream_map;
+    while (cur) {
+        if (cur->stream == stream) {
+            unsigned long index = cur->index;
+            pthread_mutex_unlock(&g_map_lock);
+            return index;
+        }
+        cur = cur->next;
+    }
+
+    struct stream_identity* item =
+        (struct stream_identity*)calloc(1, sizeof(*item));
+    if (!item) {
+        pthread_mutex_unlock(&g_map_lock);
+        return 0;
+    }
+    item->stream = stream;
+    item->index = g_stream_count++;
+    item->next = g_stream_map;
+    g_stream_map = item;
+    unsigned long index = item->index;
+    pthread_mutex_unlock(&g_map_lock);
+    return index;
+}
+
+static void parse_pattern_prefix(const char* raw_text,
+                                 const char** text,
+                                 int* is_regex,
+                                 int* is_exact,
+                                 int force_regex) {
+    *is_regex = force_regex;
+    *is_exact = 0;
+    *text = raw_text ? raw_text : "";
+    if (strncmp(*text, "regex:", 6) == 0) {
+        *is_regex = 1;
+        *text += 6;
+    } else if (strncmp(*text, "exact:", 6) == 0) {
+        *is_exact = 1;
+        *text += 6;
+    } else if (strncmp(*text, "substr:", 7) == 0) {
+        *text += 7;
+    }
+}
+
+static int pattern_matches_kernel(const char* kernel_name,
+                                  const char* pattern,
+                                  int is_regex,
+                                  int is_exact,
+                                  int regex_ready,
+                                  regex_t* regex) {
+    if (!pattern || !pattern[0]) {
+        return 0;
+    }
+    if (kernel_name_is_unknown(kernel_name)) {
+        return 0;
+    }
+    if (is_regex) {
+        return regex_ready && regex &&
+               regexec(regex, kernel_name, 0, NULL, 0) == 0;
+    }
+    if (is_exact) {
+        return strcmp(kernel_name, pattern) == 0;
+    }
+    return strcasestr(kernel_name, pattern) != NULL;
 }
 
 static char* trim_inplace(char* text) {
@@ -368,15 +505,7 @@ static void add_expected_kernel_pattern(const char* raw_text, int force_regex) {
     int is_regex = force_regex;
     int is_exact = 0;
     const char* text = raw_text;
-    if (strncmp(text, "regex:", 6) == 0) {
-        is_regex = 1;
-        text += 6;
-    } else if (strncmp(text, "exact:", 6) == 0) {
-        is_exact = 1;
-        text += 6;
-    } else if (strncmp(text, "substr:", 7) == 0) {
-        text += 7;
-    }
+    parse_pattern_prefix(raw_text, &text, &is_regex, &is_exact, force_regex);
     if (!text[0]) {
         return;
     }
@@ -420,6 +549,131 @@ static void parse_expected_kernel_list(const char* value, int force_regex) {
     free(copy);
 }
 
+static int parse_rank_field(const char* text) {
+    if (!text || !text[0] || strcmp(text, "*") == 0 || strcasecmp(text, "any") == 0) {
+        return -1;
+    }
+    return atoi(text);
+}
+
+static void add_expected_sequence_node(const char* raw_line) {
+    if (!raw_line || !raw_line[0]) {
+        return;
+    }
+    char* line_copy = strdup(raw_line);
+    if (!line_copy) {
+        return;
+    }
+    char* fields[5] = {0};
+    char* saveptr = NULL;
+    char* token = strtok_r(line_copy, "\t", &saveptr);
+    int idx = 0;
+    while (token && idx < 5) {
+        fields[idx++] = trim_inplace(token);
+        token = strtok_r(NULL, "\t", &saveptr);
+    }
+    if (idx < 5 || !fields[3] || !fields[4] || !fields[4][0]) {
+        free(line_copy);
+        return;
+    }
+
+    const char* pattern_text = NULL;
+    int is_regex = 0;
+    int is_exact = 0;
+    parse_pattern_prefix(fields[4], &pattern_text, &is_regex, &is_exact, 0);
+    if (!pattern_text || !pattern_text[0]) {
+        free(line_copy);
+        return;
+    }
+
+    struct expected_sequence_node* node =
+        (struct expected_sequence_node*)calloc(1, sizeof(*node));
+    if (!node) {
+        free(line_copy);
+        return;
+    }
+    node->rank = parse_rank_field(fields[0]);
+    snprintf(node->stream_label, sizeof(node->stream_label), "%s",
+             fields[1] && fields[1][0] ? fields[1] : "*");
+    node->ordinal = strtoul(fields[2], NULL, 10);
+    node->node_id = strdup(fields[3]);
+    node->pattern = strdup(pattern_text);
+    node->is_regex = is_regex;
+    node->is_exact = is_exact;
+    if (node->is_regex) {
+        node->regex_ready =
+            regcomp(&node->regex, node->pattern, REG_EXTENDED | REG_NOSUB | REG_ICASE) == 0;
+    }
+    if (!node->node_id || !node->pattern) {
+        if (node->is_regex && node->regex_ready) {
+            regfree(&node->regex);
+        }
+        free(node->node_id);
+        free(node->pattern);
+        free(node);
+        free(line_copy);
+        return;
+    }
+    node->next = g_expected_sequence;
+    g_expected_sequence = node;
+    g_expected_sequence_count++;
+    free(line_copy);
+}
+
+static void parse_expected_sequence(const char* value) {
+    if (!value || !value[0]) {
+        return;
+    }
+    char* copy = strdup(value);
+    if (!copy) {
+        return;
+    }
+    char* saveptr = NULL;
+    char* line = strtok_r(copy, "\n;", &saveptr);
+    while (line) {
+        char* trimmed = trim_inplace(line);
+        add_expected_sequence_node(trimmed);
+        line = strtok_r(NULL, "\n;", &saveptr);
+    }
+    free(copy);
+}
+
+static int sequence_node_applies_to_stream(const struct expected_sequence_node* node,
+                                           const char* stream_label) {
+    return node &&
+           (node->rank < 0 || node->rank == g_rank) &&
+           (strcmp(node->stream_label, "*") == 0 ||
+            strcmp(node->stream_label, stream_label) == 0);
+}
+
+static struct expected_sequence_node* find_sequence_node(const char* stream_label,
+                                                         unsigned long ordinal) {
+    for (struct expected_sequence_node* node = g_expected_sequence; node; node = node->next) {
+        if (node->ordinal == ordinal && sequence_node_applies_to_stream(node, stream_label)) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static struct sequence_cursor* sequence_cursor_for(const char* stream_label) {
+    struct sequence_cursor* cur = g_sequence_cursors;
+    while (cur) {
+        if (strcmp(cur->stream_label, stream_label) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    struct sequence_cursor* created = (struct sequence_cursor*)calloc(1, sizeof(*created));
+    if (!created) {
+        return NULL;
+    }
+    snprintf(created->stream_label, sizeof(created->stream_label), "%s", stream_label);
+    created->next = g_sequence_cursors;
+    g_sequence_cursors = created;
+    return created;
+}
+
 static int kernel_name_is_unknown(const char* kernel_name) {
     return !kernel_name || !kernel_name[0] || strcmp(kernel_name, "<unknown>") == 0;
 }
@@ -435,24 +689,82 @@ static int kernel_matches_expected(const char* kernel_name) {
         if (!p->text || !p->text[0]) {
             continue;
         }
-        if (p->is_regex) {
-            if (p->regex_ready && regexec(&p->regex, kernel_name, 0, NULL, 0) == 0) {
-                return 1;
-            }
-        } else if (p->is_exact) {
-            if (strcmp(kernel_name, p->text) == 0) {
-                return 1;
-            }
-        } else if (strcasestr(kernel_name, p->text) != NULL) {
+        if (pattern_matches_kernel(kernel_name, p->text, p->is_regex,
+                                   p->is_exact, p->regex_ready, &p->regex)) {
             return 1;
         }
     }
-    return 0;
+	    return 0;
 }
 
-static struct launch_capture_decision choose_launch_capture(const char* kernel_name) {
+static void open_adaptive_trigger_window(void) {
+    if (g_collection_mode != COLLECTION_ADAPTIVE_NAME || g_trigger_capture_after == 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_adaptive_lock);
+    if (g_trigger_window_remaining < g_trigger_capture_after) {
+        g_trigger_window_remaining = g_trigger_capture_after;
+    }
+    pthread_mutex_unlock(&g_adaptive_lock);
+}
+
+static struct launch_capture_decision choose_launch_capture(const char* kernel_name, void* stream) {
     struct launch_capture_decision decision;
     memset(&decision, 0, sizeof(decision));
+    decision.stream_index = stream_index_for(stream);
+    snprintf(decision.stream_label, sizeof(decision.stream_label), "s%lu", decision.stream_index);
+
+    if (g_expected_sequence_count > 0) {
+        pthread_mutex_lock(&g_adaptive_lock);
+        struct sequence_cursor* cursor = sequence_cursor_for(decision.stream_label);
+        struct expected_sequence_node* node =
+            cursor ? find_sequence_node(decision.stream_label, cursor->expected_ordinal) : NULL;
+        if (!node && cursor && g_sequence_repeat) {
+            cursor->expected_ordinal = 0;
+            node = find_sequence_node(decision.stream_label, cursor->expected_ordinal);
+        }
+        decision.actual_ordinal = cursor ? cursor->actual_ordinal++ : 0;
+        decision.expected_ordinal = cursor ? cursor->expected_ordinal : 0;
+        if (node && pattern_matches_kernel(kernel_name, node->pattern, node->is_regex,
+                                           node->is_exact, node->regex_ready, &node->regex)) {
+            decision.matched_expected = 1;
+            snprintf(decision.sketch_node_id, sizeof(decision.sketch_node_id), "%s",
+                     node->node_id ? node->node_id : "");
+            if (cursor) {
+                cursor->expected_ordinal++;
+            }
+        } else {
+            decision.matched_expected = 0;
+        }
+
+        if (g_collection_mode == COLLECTION_FULL) {
+            decision.full_timing = 1;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "full");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "full_mode");
+        } else if (g_collection_mode == COLLECTION_NAME_ONLY) {
+            decision.full_timing = 0;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "name_only");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "name_only_mode");
+        } else if (!decision.matched_expected) {
+            decision.full_timing = 1;
+            decision.triggered = 1;
+            g_trigger_window_remaining = g_trigger_capture_after;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "trigger_full");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "sequence_mismatch");
+        } else if (g_trigger_window_remaining > 0) {
+            decision.full_timing = 1;
+            g_trigger_window_remaining--;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "trigger_window");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "after_unexpected_kernel");
+        } else {
+            decision.full_timing = 0;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "name_only");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "matched_sequence_node");
+        }
+        pthread_mutex_unlock(&g_adaptive_lock);
+        return decision;
+    }
+
     decision.matched_expected = kernel_matches_expected(kernel_name);
 
     if (g_collection_mode == COLLECTION_FULL) {
@@ -501,6 +813,10 @@ static void apply_capture_decision(struct launch_item* item,
              decision->trigger_reason);
     item->matched_expected = decision->matched_expected;
     item->adaptive_trigger = decision->triggered;
+    item->expected_ordinal = decision->expected_ordinal;
+    item->actual_ordinal = decision->actual_ordinal;
+    snprintf(item->sketch_node_id, sizeof(item->sketch_node_id), "%s",
+             decision->sketch_node_id);
 }
 
 static void free_expected_kernel_patterns(void) {
@@ -514,6 +830,41 @@ static void free_expected_kernel_patterns(void) {
         free(pattern->text);
         free(pattern);
         pattern = next;
+    }
+}
+
+static void free_expected_sequence(void) {
+    struct expected_sequence_node* node = g_expected_sequence;
+    g_expected_sequence = NULL;
+    while (node) {
+        struct expected_sequence_node* next = node->next;
+        if (node->is_regex && node->regex_ready) {
+            regfree(&node->regex);
+        }
+        free(node->node_id);
+        free(node->pattern);
+        free(node);
+        node = next;
+    }
+
+    struct sequence_cursor* cursor = g_sequence_cursors;
+    g_sequence_cursors = NULL;
+    while (cursor) {
+        struct sequence_cursor* next = cursor->next;
+        free(cursor);
+        cursor = next;
+    }
+}
+
+static void free_stream_identities(void) {
+    pthread_mutex_lock(&g_map_lock);
+    struct stream_identity* item = g_stream_map;
+    g_stream_map = NULL;
+    pthread_mutex_unlock(&g_map_lock);
+    while (item) {
+        struct stream_identity* next = item->next;
+        free(item);
+        item = next;
     }
 }
 
@@ -641,18 +992,22 @@ static int __attribute__((unused)) is_interposable_cuda_symbol(const char* symbo
            strcmp(symbol, "cuLibraryGetKernel") == 0 ||
            strcmp(symbol, "cuLibraryGetModule") == 0 ||
            strcmp(symbol, "cuFuncGetName") == 0 ||
-           strcmp(symbol, "cuLaunchKernel") == 0 ||
-           strcmp(symbol, "cuLaunchKernel_ptsz") == 0 ||
-           strcmp(symbol, "cuLaunchKernelEx") == 0 ||
-           strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0 ||
-           strcmp(symbol, "cudaLaunchKernel") == 0 ||
-           strcmp(symbol, "cudaLaunchKernel_ptsz") == 0 ||
-           strcmp(symbol, "cudaLaunchCooperativeKernel") == 0 ||
-           strcmp(symbol, "cudaLaunchCooperativeKernel_ptsz") == 0 ||
-           strcmp(symbol, "cudaLaunchKernelExC") == 0 ||
-           strcmp(symbol, "cudaLaunchKernelExC_ptsz") == 0 ||
-           strcmp(symbol, "cuGetProcAddress") == 0 ||
-           strcmp(symbol, "cuGetProcAddress_v2") == 0;
+	           strcmp(symbol, "cuLaunchKernel") == 0 ||
+	           strcmp(symbol, "cuLaunchKernel_ptsz") == 0 ||
+	           strcmp(symbol, "cuLaunchKernelEx") == 0 ||
+	           strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0 ||
+	           strcmp(symbol, "cuStreamWaitEvent") == 0 ||
+	           strcmp(symbol, "cuStreamWaitEvent_ptsz") == 0 ||
+	           strcmp(symbol, "cudaLaunchKernel") == 0 ||
+	           strcmp(symbol, "cudaLaunchKernel_ptsz") == 0 ||
+	           strcmp(symbol, "cudaLaunchCooperativeKernel") == 0 ||
+	           strcmp(symbol, "cudaLaunchCooperativeKernel_ptsz") == 0 ||
+	           strcmp(symbol, "cudaLaunchKernelExC") == 0 ||
+	           strcmp(symbol, "cudaLaunchKernelExC_ptsz") == 0 ||
+	           strcmp(symbol, "cudaStreamWaitEvent") == 0 ||
+	           strcmp(symbol, "cudaStreamWaitEvent_ptsz") == 0 ||
+	           strcmp(symbol, "cuGetProcAddress") == 0 ||
+	           strcmp(symbol, "cuGetProcAddress_v2") == 0;
 }
 
 static int is_blocked_interposer_caller(void* caller) {
@@ -808,20 +1163,34 @@ static void refresh_driver_symbols(void) {
             real_cuEventElapsedTime = (cuEventElapsedTime_t)dlsym_libcuda("cuEventElapsedTime");
         }
     }
-    if (!real_cuEventDestroy) {
-        real_cuEventDestroy = (cuEventDestroy_t)dlsym_next_any("cuEventDestroy_v2", "cuEventDestroy");
-        if (!real_cuEventDestroy) {
-            real_cuEventDestroy = (cuEventDestroy_t)dlsym_libcuda("cuEventDestroy_v2");
-        }
-        if (!real_cuEventDestroy) {
-            real_cuEventDestroy = (cuEventDestroy_t)dlsym_libcuda("cuEventDestroy");
-        }
-    }
-    refresh_getproc_symbols();
-    if (real_cuLaunchKernel || real_cuLaunchKernel_ptsz ||
-        real_cuLaunchKernelEx || real_cuLaunchKernelEx_ptsz) {
-        g_driver_symbols_refreshed = 1;
-    }
+	    if (!real_cuEventDestroy) {
+	        real_cuEventDestroy = (cuEventDestroy_t)dlsym_next_any("cuEventDestroy_v2", "cuEventDestroy");
+	        if (!real_cuEventDestroy) {
+	            real_cuEventDestroy = (cuEventDestroy_t)dlsym_libcuda("cuEventDestroy_v2");
+	        }
+	        if (!real_cuEventDestroy) {
+	            real_cuEventDestroy = (cuEventDestroy_t)dlsym_libcuda("cuEventDestroy");
+	        }
+	    }
+	    if (!real_cuStreamWaitEvent) {
+	        real_cuStreamWaitEvent = (cuStreamWaitEvent_t)dlsym_next_any("cuStreamWaitEvent", NULL);
+	        if (!real_cuStreamWaitEvent) {
+	            real_cuStreamWaitEvent = (cuStreamWaitEvent_t)dlsym_libcuda("cuStreamWaitEvent");
+	        }
+	    }
+	    if (!real_cuStreamWaitEvent_ptsz) {
+	        real_cuStreamWaitEvent_ptsz =
+	            (cuStreamWaitEvent_t)dlsym_next_any("cuStreamWaitEvent_ptsz", NULL);
+	        if (!real_cuStreamWaitEvent_ptsz) {
+	            real_cuStreamWaitEvent_ptsz =
+	                (cuStreamWaitEvent_t)dlsym_libcuda("cuStreamWaitEvent_ptsz");
+	        }
+	    }
+	    refresh_getproc_symbols();
+	    if (real_cuLaunchKernel || real_cuLaunchKernel_ptsz ||
+	        real_cuLaunchKernelEx || real_cuLaunchKernelEx_ptsz) {
+	        g_driver_symbols_refreshed = 1;
+	    }
 }
 
 static void refresh_runtime_symbols(void) {
@@ -860,18 +1229,70 @@ static void refresh_runtime_symbols(void) {
                 (cudaLaunchCooperativeKernel_t)dlsym_libcudart("cudaLaunchCooperativeKernel");
         }
     }
-    if (!real_cudaLaunchCooperativeKernel_ptsz) {
-        real_cudaLaunchCooperativeKernel_ptsz =
-            (cudaLaunchCooperativeKernel_t)dlsym_next_any("cudaLaunchCooperativeKernel_ptsz", NULL);
-        if (!real_cudaLaunchCooperativeKernel_ptsz) {
-            real_cudaLaunchCooperativeKernel_ptsz =
-                (cudaLaunchCooperativeKernel_t)dlsym_libcudart("cudaLaunchCooperativeKernel_ptsz");
+	    if (!real_cudaLaunchCooperativeKernel_ptsz) {
+	        real_cudaLaunchCooperativeKernel_ptsz =
+	            (cudaLaunchCooperativeKernel_t)dlsym_next_any("cudaLaunchCooperativeKernel_ptsz", NULL);
+	        if (!real_cudaLaunchCooperativeKernel_ptsz) {
+	            real_cudaLaunchCooperativeKernel_ptsz =
+	                (cudaLaunchCooperativeKernel_t)dlsym_libcudart("cudaLaunchCooperativeKernel_ptsz");
+	        }
+	    }
+	    if (!real_cudaStreamWaitEvent) {
+	        real_cudaStreamWaitEvent =
+	            (cudaStreamWaitEvent_t)dlsym_next_any("cudaStreamWaitEvent", NULL);
+	        if (!real_cudaStreamWaitEvent) {
+	            real_cudaStreamWaitEvent =
+	                (cudaStreamWaitEvent_t)dlsym_libcudart("cudaStreamWaitEvent");
+	        }
+	    }
+	    if (!real_cudaStreamWaitEvent_ptsz) {
+	        real_cudaStreamWaitEvent_ptsz =
+	            (cudaStreamWaitEvent_t)dlsym_next_any("cudaStreamWaitEvent_ptsz", NULL);
+	        if (!real_cudaStreamWaitEvent_ptsz) {
+	            real_cudaStreamWaitEvent_ptsz =
+	                (cudaStreamWaitEvent_t)dlsym_libcudart("cudaStreamWaitEvent_ptsz");
+	        }
+	    }
+	    if (real_cudaLaunchKernel || real_cudaLaunchKernel_ptsz ||
+	        real_cudaLaunchKernelExC || real_cudaLaunchKernelExC_ptsz ||
+	        real_cudaLaunchCooperativeKernel || real_cudaLaunchCooperativeKernel_ptsz) {
+	        g_runtime_symbols_refreshed = 1;
+	    }
+	}
+
+static void ensure_driver_wait_symbols(void) {
+    if (!real_cuStreamWaitEvent) {
+        real_cuStreamWaitEvent = (cuStreamWaitEvent_t)dlsym_next_any("cuStreamWaitEvent", NULL);
+        if (!real_cuStreamWaitEvent) {
+            real_cuStreamWaitEvent = (cuStreamWaitEvent_t)dlsym_libcuda("cuStreamWaitEvent");
         }
     }
-    if (real_cudaLaunchKernel || real_cudaLaunchKernel_ptsz ||
-        real_cudaLaunchKernelExC || real_cudaLaunchKernelExC_ptsz ||
-        real_cudaLaunchCooperativeKernel || real_cudaLaunchCooperativeKernel_ptsz) {
-        g_runtime_symbols_refreshed = 1;
+    if (!real_cuStreamWaitEvent_ptsz) {
+        real_cuStreamWaitEvent_ptsz =
+            (cuStreamWaitEvent_t)dlsym_next_any("cuStreamWaitEvent_ptsz", NULL);
+        if (!real_cuStreamWaitEvent_ptsz) {
+            real_cuStreamWaitEvent_ptsz =
+                (cuStreamWaitEvent_t)dlsym_libcuda("cuStreamWaitEvent_ptsz");
+        }
+    }
+}
+
+static void ensure_runtime_wait_symbols(void) {
+    if (!real_cudaStreamWaitEvent) {
+        real_cudaStreamWaitEvent =
+            (cudaStreamWaitEvent_t)dlsym_next_any("cudaStreamWaitEvent", NULL);
+        if (!real_cudaStreamWaitEvent) {
+            real_cudaStreamWaitEvent =
+                (cudaStreamWaitEvent_t)dlsym_libcudart("cudaStreamWaitEvent");
+        }
+    }
+    if (!real_cudaStreamWaitEvent_ptsz) {
+        real_cudaStreamWaitEvent_ptsz =
+            (cudaStreamWaitEvent_t)dlsym_next_any("cudaStreamWaitEvent_ptsz", NULL);
+        if (!real_cudaStreamWaitEvent_ptsz) {
+            real_cudaStreamWaitEvent_ptsz =
+                (cudaStreamWaitEvent_t)dlsym_libcudart("cudaStreamWaitEvent_ptsz");
+        }
     }
 }
 
@@ -974,18 +1395,23 @@ static void format_send_launch_record(const struct launch_emit_record* rec) {
     char escaped_reason[128];
     json_escape(rec->capture_mode, escaped_mode, sizeof(escaped_mode));
     json_escape(rec->trigger_reason, escaped_reason, sizeof(escaped_reason));
-    char buf[4096];
+    char escaped_node[256];
+    json_escape(rec->sketch_node_id, escaped_node, sizeof(escaped_node));
+    char buf[8192];
     unsigned long long threads_per_block =
         (unsigned long long)rec->block[0] * rec->block[1] * rec->block[2];
     unsigned long long blocks_total =
         (unsigned long long)rec->grid[0] * rec->grid[1] * rec->grid[2];
     int n = snprintf(
         buf, sizeof(buf),
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_launch\",\"source\":\"weaver_hook\",\"kernel_name\":\"%s\",\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"dur_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"stream\":\"%p\",\"payload\":{\"launch_id\":%llu,\"ret\":%d,\"kernel\":\"%s\",\"kernel_name\":\"%s\",\"func\":\"%p\",\"stream\":\"%p\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared_mem\":%u,\"shared_memory\":%u,\"threads_per_block\":%llu,\"blocks_total\":%llu,\"warps_per_block\":%llu,\"total_warps\":%llu,\"warp_size\":32,\"warp_scope\":\"block_runtime\",\"gpu_duration_ns\":%lld,\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"cuda_event_timing\":%s,\"time_alignment\":\"%s\",\"poll_ready_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"capture_mode\":\"%s\",\"trigger_reason\":\"%s\",\"matched_expected\":%s,\"adaptive_trigger\":%s}}",
-        rec->gpu_start_ns, rec->pid, rec->tid, escaped,
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"cuda\",\"kind\":\"kernel_launch\",\"source\":\"weaver_hook\",\"kernel_name\":\"%s\",\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"dur_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"payload\":{\"launch_id\":%llu,\"ret\":%d,\"kernel\":\"%s\",\"kernel_name\":\"%s\",\"func\":\"%p\",\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"sketch_node_id\":\"%s\",\"expected_ordinal\":%lu,\"actual_ordinal\":%lu,\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared_mem\":%u,\"shared_memory\":%u,\"threads_per_block\":%llu,\"blocks_total\":%llu,\"warps_per_block\":%llu,\"total_warps\":%llu,\"warp_size\":32,\"warp_scope\":\"block_runtime\",\"gpu_duration_ns\":%lld,\"gpu_start_ns\":%lld,\"gpu_end_ns\":%lld,\"cuda_event_timing\":%s,\"time_alignment\":\"%s\",\"poll_ready_ns\":%lld,\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"capture_mode\":\"%s\",\"trigger_reason\":\"%s\",\"matched_expected\":%s,\"adaptive_trigger\":%s}}",
+        rec->gpu_start_ns, rec->pid, rec->tid, g_rank, g_local_rank, g_world_size, escaped,
         rec->gpu_start_ns, rec->gpu_end_ns, rec->gpu_duration_ns,
         rec->cpu_enqueue_start_ns, rec->cpu_enqueue_end_ns, rec->stream,
+        rec->stream_index, rec->stream_label,
         rec->launch_id, rec->ret, escaped, escaped, rec->func, rec->stream,
+        rec->stream_index, rec->stream_label,
+        escaped_node, rec->expected_ordinal, rec->actual_ordinal,
         rec->grid[0], rec->grid[1], rec->grid[2],
         rec->block[0], rec->block[1], rec->block[2],
         rec->shared_mem, rec->shared_mem,
@@ -1007,23 +1433,61 @@ static void format_send_launch_record(const struct launch_emit_record* rec) {
 }
 
 static void emit_kernel_name_only(const char* kernel_name,
+                                  void* stream,
                                   unsigned long long launch_id,
                                   int ret,
                                   const struct launch_capture_decision* decision) {
     char escaped[512];
     char escaped_mode[64];
     char escaped_reason[128];
+    char escaped_node[256];
     json_escape(kernel_name ? kernel_name : "<unknown>", escaped, sizeof(escaped));
     json_escape(decision ? decision->capture_mode : "name_only",
                 escaped_mode, sizeof(escaped_mode));
     json_escape(decision ? decision->trigger_reason : "name_only",
                 escaped_reason, sizeof(escaped_reason));
+    json_escape(decision ? decision->sketch_node_id : "",
+                escaped_node, sizeof(escaped_node));
+    unsigned long stream_index = decision ? decision->stream_index : stream_index_for(stream);
+    char stream_label[32];
+    snprintf(stream_label, sizeof(stream_label), "%s",
+             (decision && decision->stream_label[0]) ? decision->stream_label : "");
+    if (!stream_label[0]) {
+        snprintf(stream_label, sizeof(stream_label), "s%lu", stream_index);
+    }
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"kernel_launch\",\"source\":\"weaver_hook\",\"kernel_name\":\"%s\",\"payload\":{\"launch_id\":%llu,\"ret\":%d,\"kernel_name\":\"%s\",\"capture_mode\":\"%s\",\"trigger_reason\":\"%s\",\"matched_expected\":%s,\"adaptive_trigger\":%s,\"cuda_event_timing\":false}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(), escaped,
-        launch_id, ret, escaped, escaped_mode, escaped_reason,
-        (!decision || decision->matched_expected) ? "true" : "false",
-        (decision && decision->triggered) ? "true" : "false");
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"cuda\",\"kind\":\"kernel_launch\",\"source\":\"weaver_hook\",\"kernel_name\":\"%s\",\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"payload\":{\"launch_id\":%llu,\"ret\":%d,\"kernel_name\":\"%s\",\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"sketch_node_id\":\"%s\",\"expected_ordinal\":%lu,\"actual_ordinal\":%lu,\"capture_mode\":\"%s\",\"trigger_reason\":\"%s\",\"matched_expected\":%s,\"adaptive_trigger\":%s,\"cuda_event_timing\":false}}",
+        now_ns(), getpid(), (unsigned long long)pthread_self(),
+        g_rank, g_local_rank, g_world_size, escaped, stream, stream_index, stream_label,
+        launch_id, ret, escaped, stream, stream_index, stream_label,
+        escaped_node,
+        decision ? decision->expected_ordinal : 0,
+        decision ? decision->actual_ordinal : 0,
+        escaped_mode, escaped_reason,
+	        (!decision || decision->matched_expected) ? "true" : "false",
+	        (decision && decision->triggered) ? "true" : "false");
+}
+
+static void emit_stream_wait_event(const char* api_name,
+                                   void* stream,
+                                   void* event,
+                                   unsigned int flags,
+                                   int ret,
+                                   long long start_ns,
+                                   long long end_ns) {
+    unsigned long stream_index = stream_index_for(stream);
+    char stream_label[32];
+    char escaped_api[128];
+    snprintf(stream_label, sizeof(stream_label), "s%lu", stream_index);
+    json_escape(api_name ? api_name : "stream_wait_event", escaped_api, sizeof(escaped_api));
+    send_json(
+        "{\"ts_ns\":%lld,\"ts_end_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"cuda\",\"kind\":\"stream_wait_event\",\"source\":\"weaver_hook\",\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"dur_ns\":%lld,\"payload\":{\"api\":\"%s\",\"ret\":%d,\"flags\":%u,\"event\":\"%p\",\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"trigger_capture_after\":%lu}}",
+        start_ns, end_ns, getpid(), (unsigned long long)pthread_self(),
+        g_rank, g_local_rank, g_world_size,
+        stream, stream_index, stream_label,
+        start_ns, end_ns, end_ns - start_ns,
+        escaped_api, ret, flags, event, stream, stream_index, stream_label,
+        g_trigger_capture_after);
 }
 
 static void* launch_emit_loop(void* unused) {
@@ -1530,6 +1994,8 @@ static void emit_kernel_launch(struct launch_item* item, long long ready_ns,
     rec.poll_ready_ns = ready_ns;
     rec.func = item->func;
     rec.stream = item->stream;
+    rec.stream_index = stream_index_for(item->stream);
+    snprintf(rec.stream_label, sizeof(rec.stream_label), "s%lu", rec.stream_index);
     rec.launch_id = item->launch_id;
     rec.ret = item->ret;
     rec.grid[0] = item->grid[0];
@@ -1549,6 +2015,10 @@ static void emit_kernel_launch(struct launch_item* item, long long ready_ns,
              item->trigger_reason[0] ? item->trigger_reason : "");
     rec.matched_expected = item->matched_expected;
     rec.adaptive_trigger = item->adaptive_trigger;
+    rec.expected_ordinal = item->expected_ordinal;
+    rec.actual_ordinal = item->actual_ordinal;
+    snprintf(rec.sketch_node_id, sizeof(rec.sketch_node_id), "%s",
+             item->sketch_node_id);
     if (!enqueue_launch_record(&rec)) {
         format_send_launch_record(&rec);
     }
@@ -1685,11 +2155,16 @@ static void init_runtime(void) {
     g_disasm_enabled = env_flag("WEAVER_ENABLE_DISASM", 0);
     g_emit_code_events = env_flag("WEAVER_EMIT_CODE_EVENTS", 0);
     g_async_launch_emit = env_flag("WEAVER_ASYNC_LAUNCH_EMIT", 1);
+    g_rank = env_int("RANK", env_int("WEAVER_RANK", -1));
+    g_local_rank = env_int("LOCAL_RANK", env_int("WEAVER_LOCAL_RANK", -1));
+    g_world_size = env_int("WORLD_SIZE", env_int("WEAVER_WORLD_SIZE", -1));
     g_collection_mode = parse_collection_mode(getenv("WEAVER_COLLECTION_MODE"));
     g_trigger_capture_after = env_ulong("WEAVER_TRIGGER_CAPTURE_AFTER", 2UL);
     g_trigger_unknown = env_flag("WEAVER_TRIGGER_UNKNOWN_KERNELS", 0);
+    g_sequence_repeat = env_flag("WEAVER_SEQUENCE_REPEAT", 1);
     parse_expected_kernel_list(getenv("WEAVER_EXPECTED_KERNELS"), 0);
     parse_expected_kernel_list(getenv("WEAVER_EXPECTED_KERNEL_REGEX"), 1);
+    parse_expected_sequence(getenv("WEAVER_EXPECTED_SEQUENCE"));
     if (g_disasm_enabled) {
         signal(SIGCHLD, SIG_IGN);
     }
@@ -1712,14 +2187,18 @@ static void init_runtime(void) {
     }
 
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"collection_mode\":\"%s\",\"expected_kernel_patterns\":%lu,\"trigger_capture_after\":%lu,\"trigger_unknown_kernels\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"async_launch_emit\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"collection_mode\":\"%s\",\"expected_kernel_patterns\":%lu,\"expected_sequence_nodes\":%lu,\"sequence_repeat\":%s,\"trigger_capture_after\":%lu,\"trigger_unknown_kernels\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"async_launch_emit\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
         now_ns(), getpid(), (unsigned long long)pthread_self(),
+        g_rank, g_local_rank, g_world_size,
+        g_rank, g_local_rank, g_world_size,
         (g_cuda_event_enabled && real_cuEventCreate && real_cuEventRecord &&
          real_cuEventQuery && real_cuEventElapsedTime) ? "true" : "false",
         g_sync_stream_anchor ? "true" : "false",
         g_cuda_event_pool_enabled ? "true" : "false",
         collection_mode_name(),
         g_expected_kernel_count,
+        g_expected_sequence_count,
+        g_sequence_repeat ? "true" : "false",
         g_trigger_capture_after,
         g_trigger_unknown ? "true" : "false",
         g_patch_dlsym ? "true" : "false",
@@ -1750,6 +2229,8 @@ __attribute__((destructor)) static void weaver_fini(void) {
     stop_launch_emit_thread();
     destroy_event_pool();
     free_expected_kernel_patterns();
+    free_expected_sequence();
+    free_stream_identities();
     if (g_sock >= 0) {
         close(g_sock);
         g_sock = -1;
@@ -1962,12 +2443,12 @@ static CUresult handle_launch(CUfunction f,
 	                              void** extra,
 	                              cuLaunchKernel_t launcher) {
 	    char* name = code_name_for(f);
-	    struct launch_capture_decision decision = choose_launch_capture(name);
+	    struct launch_capture_decision decision = choose_launch_capture(name, hStream);
 	    if (!decision.full_timing) {
 	        CUresult ret = launcher(f, gridDimX, gridDimY, gridDimZ,
 	                                blockDimX, blockDimY, blockDimZ,
 	                                sharedMemBytes, hStream, kernelParams, extra);
-	        emit_kernel_name_only(name, __sync_add_and_fetch(&g_launch_seq, 1),
+	        emit_kernel_name_only(name, hStream, __sync_add_and_fetch(&g_launch_seq, 1),
 	                              ret, &decision);
 	        free(name);
 	        return ret;
@@ -2106,10 +2587,10 @@ static CUresult handle_launch_ex(const CUlaunchConfig* config,
     }
 
 	    char* name = code_name_for(f);
-	    struct launch_capture_decision decision = choose_launch_capture(name);
+	    struct launch_capture_decision decision = choose_launch_capture(name, config->hStream);
 	    if (!decision.full_timing) {
 	        CUresult ret = launcher(config, f, kernelParams, extra);
-	        emit_kernel_name_only(name, __sync_add_and_fetch(&g_launch_seq, 1),
+	        emit_kernel_name_only(name, config->hStream, __sync_add_and_fetch(&g_launch_seq, 1),
 	                              ret, &decision);
 	        free(name);
 	        return ret;
@@ -2221,10 +2702,10 @@ static cudaError_t handle_runtime_launch(const void* func,
 	                                         cudaLaunchKernel_runtime_t launcher,
 	                                         const char* api_name) {
 	    char* name = runtime_name_for(func);
-	    struct launch_capture_decision decision = choose_launch_capture(name);
+	    struct launch_capture_decision decision = choose_launch_capture(name, stream);
 	    if (!decision.full_timing) {
 	        cudaError_t ret = launcher(func, gridDim, blockDim, args, sharedMem, stream);
-	        emit_kernel_name_only(name, __sync_add_and_fetch(&g_launch_seq, 1),
+	        emit_kernel_name_only(name, stream, __sync_add_and_fetch(&g_launch_seq, 1),
 	                              ret, &decision);
 	        free(name);
 	        return ret;
@@ -2383,10 +2864,10 @@ static cudaError_t handle_runtime_launch_ex(const cudaLaunchConfig_runtime* conf
     }
 
 	    char* name = runtime_name_for(func);
-	    struct launch_capture_decision decision = choose_launch_capture(name);
+	    struct launch_capture_decision decision = choose_launch_capture(name, config->stream);
 	    if (!decision.full_timing) {
 	        cudaError_t ret = launcher(config, func, args);
-	        emit_kernel_name_only(name, __sync_add_and_fetch(&g_launch_seq, 1),
+	        emit_kernel_name_only(name, config->stream, __sync_add_and_fetch(&g_launch_seq, 1),
 	                              ret, &decision);
 	        free(name);
 	        return ret;
@@ -2493,7 +2974,71 @@ cudaError_t cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_runtime* config,
     }
     return handle_runtime_launch_ex(config, func, args,
                                     launcher,
-                                    "runtime_ex_ptsz_cpu_enqueue_fallback");
+	                                    "runtime_ex_ptsz_cpu_enqueue_fallback");
+	}
+
+CUresult cuStreamWaitEvent(CUstream stream, CUevent event, unsigned int flags) {
+    init_once();
+    refresh_driver_symbols();
+    ensure_driver_wait_symbols();
+    if (!real_cuStreamWaitEvent) {
+        return 1;
+    }
+    long long start = now_ns();
+    CUresult ret = real_cuStreamWaitEvent(stream, event, flags);
+    long long end = now_ns();
+    open_adaptive_trigger_window();
+    emit_stream_wait_event("cuStreamWaitEvent", stream, event, flags, ret, start, end);
+    return ret;
+}
+
+CUresult cuStreamWaitEvent_ptsz(CUstream stream, CUevent event, unsigned int flags) {
+    init_once();
+    refresh_driver_symbols();
+    ensure_driver_wait_symbols();
+    cuStreamWaitEvent_t waiter =
+        real_cuStreamWaitEvent_ptsz ? real_cuStreamWaitEvent_ptsz : real_cuStreamWaitEvent;
+    if (!waiter) {
+        return 1;
+    }
+    long long start = now_ns();
+    CUresult ret = waiter(stream, event, flags);
+    long long end = now_ns();
+    open_adaptive_trigger_window();
+    emit_stream_wait_event("cuStreamWaitEvent_ptsz", stream, event, flags, ret, start, end);
+    return ret;
+}
+
+cudaError_t cudaStreamWaitEvent(cudaStream_t stream, CUevent event, unsigned int flags) {
+    init_once();
+    refresh_runtime_symbols();
+    ensure_runtime_wait_symbols();
+    if (!real_cudaStreamWaitEvent) {
+        return 1;
+    }
+    long long start = now_ns();
+    cudaError_t ret = real_cudaStreamWaitEvent(stream, event, flags);
+    long long end = now_ns();
+    open_adaptive_trigger_window();
+    emit_stream_wait_event("cudaStreamWaitEvent", stream, event, flags, ret, start, end);
+    return ret;
+}
+
+cudaError_t cudaStreamWaitEvent_ptsz(cudaStream_t stream, CUevent event, unsigned int flags) {
+    init_once();
+    refresh_runtime_symbols();
+    ensure_runtime_wait_symbols();
+    cudaStreamWaitEvent_t waiter =
+        real_cudaStreamWaitEvent_ptsz ? real_cudaStreamWaitEvent_ptsz : real_cudaStreamWaitEvent;
+    if (!waiter) {
+        return 1;
+    }
+    long long start = now_ns();
+    cudaError_t ret = waiter(stream, event, flags);
+    long long end = now_ns();
+    open_adaptive_trigger_window();
+    emit_stream_wait_event("cudaStreamWaitEvent_ptsz", stream, event, flags, ret, start, end);
+    return ret;
 }
 
 CUresult cuGetProcAddress(const char* symbol,
@@ -2571,16 +3116,26 @@ static void* patch_symbol_pointer(const char* symbol, void* pfn) {
             real_cuLaunchKernelEx = (cuLaunchKernelEx_t)pfn;
         }
         return (void*)cuLaunchKernelEx;
-    } else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) {
-        if (!real_cuLaunchKernelEx_ptsz) {
-            real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)pfn;
-        }
-        return (void*)cuLaunchKernelEx_ptsz;
-    } else if (strcmp(symbol, "cudaLaunchKernel") == 0) {
-        if (!real_cudaLaunchKernel) {
-            real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)pfn;
-        }
-        return (void*)cudaLaunchKernel;
+	    } else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) {
+	        if (!real_cuLaunchKernelEx_ptsz) {
+	            real_cuLaunchKernelEx_ptsz = (cuLaunchKernelEx_t)pfn;
+	        }
+	        return (void*)cuLaunchKernelEx_ptsz;
+	    } else if (strcmp(symbol, "cuStreamWaitEvent") == 0) {
+	        if (!real_cuStreamWaitEvent) {
+	            real_cuStreamWaitEvent = (cuStreamWaitEvent_t)pfn;
+	        }
+	        return (void*)cuStreamWaitEvent;
+	    } else if (strcmp(symbol, "cuStreamWaitEvent_ptsz") == 0) {
+	        if (!real_cuStreamWaitEvent_ptsz) {
+	            real_cuStreamWaitEvent_ptsz = (cuStreamWaitEvent_t)pfn;
+	        }
+	        return (void*)cuStreamWaitEvent_ptsz;
+	    } else if (strcmp(symbol, "cudaLaunchKernel") == 0) {
+	        if (!real_cudaLaunchKernel) {
+	            real_cudaLaunchKernel = (cudaLaunchKernel_runtime_t)pfn;
+	        }
+	        return (void*)cudaLaunchKernel;
     } else if (strcmp(symbol, "cudaLaunchKernel_ptsz") == 0) {
         if (!real_cudaLaunchKernel_ptsz) {
             real_cudaLaunchKernel_ptsz = (cudaLaunchKernel_runtime_t)pfn;
@@ -2601,15 +3156,25 @@ static void* patch_symbol_pointer(const char* symbol, void* pfn) {
             real_cudaLaunchKernelExC = (cudaLaunchKernelExC_t)pfn;
         }
         return (void*)cudaLaunchKernelExC;
-    } else if (strcmp(symbol, "cudaLaunchKernelExC_ptsz") == 0) {
-        if (!real_cudaLaunchKernelExC_ptsz) {
-            real_cudaLaunchKernelExC_ptsz = (cudaLaunchKernelExC_t)pfn;
-        }
-        return (void*)cudaLaunchKernelExC_ptsz;
-    } else if (strcmp(symbol, "cuGetProcAddress") == 0) {
-        if (!real_cuGetProcAddress && pfn != (void*)cuGetProcAddress) {
-            real_cuGetProcAddress = (cuGetProcAddress_t)pfn;
-        }
+	    } else if (strcmp(symbol, "cudaLaunchKernelExC_ptsz") == 0) {
+	        if (!real_cudaLaunchKernelExC_ptsz) {
+	            real_cudaLaunchKernelExC_ptsz = (cudaLaunchKernelExC_t)pfn;
+	        }
+	        return (void*)cudaLaunchKernelExC_ptsz;
+	    } else if (strcmp(symbol, "cudaStreamWaitEvent") == 0) {
+	        if (!real_cudaStreamWaitEvent) {
+	            real_cudaStreamWaitEvent = (cudaStreamWaitEvent_t)pfn;
+	        }
+	        return (void*)cudaStreamWaitEvent;
+	    } else if (strcmp(symbol, "cudaStreamWaitEvent_ptsz") == 0) {
+	        if (!real_cudaStreamWaitEvent_ptsz) {
+	            real_cudaStreamWaitEvent_ptsz = (cudaStreamWaitEvent_t)pfn;
+	        }
+	        return (void*)cudaStreamWaitEvent_ptsz;
+	    } else if (strcmp(symbol, "cuGetProcAddress") == 0) {
+	        if (!real_cuGetProcAddress && pfn != (void*)cuGetProcAddress) {
+	            real_cuGetProcAddress = (cuGetProcAddress_t)pfn;
+	        }
         return (void*)cuGetProcAddress;
     } else if (strcmp(symbol, "cuGetProcAddress_v2") == 0) {
         if (!real_cuGetProcAddress_v2 && pfn != (void*)cuGetProcAddress_v2) {
@@ -2722,11 +3287,18 @@ void* dlsym(void* handle, const char* symbol) {
 #endif
 
 static void send_nccl_event(const char* kind, size_t count, int ret,
-                            long long start_ns, long long end_ns) {
+                            long long start_ns, long long end_ns,
+                            CUstream stream) {
+    unsigned long stream_index = stream_index_for(stream);
+    char stream_label[32];
+    snprintf(stream_label, sizeof(stream_label), "s%lu", stream_index);
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"layer\":\"cuda\",\"kind\":\"%s\",\"source\":\"weaver_hook\",\"kernel_name\":\"nccl::%s\",\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"dur_ns\":%lld,\"payload\":{\"ret\":%d,\"count\":%zu,\"component\":\"nccl\",\"cuda_event_timing\":false}}",
-        start_ns, getpid(), (unsigned long long)pthread_self(), kind, kind,
-        start_ns, end_ns, end_ns - start_ns, ret, count);
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"cuda\",\"kind\":\"%s\",\"source\":\"weaver_hook\",\"kernel_name\":\"nccl::%s\",\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"cpu_enqueue_start_ns\":%lld,\"cpu_enqueue_end_ns\":%lld,\"dur_ns\":%lld,\"payload\":{\"ret\":%d,\"count\":%zu,\"component\":\"nccl\",\"stream\":\"%p\",\"stream_index\":%lu,\"stream_label\":\"%s\",\"cuda_event_timing\":false}}",
+        start_ns, getpid(), (unsigned long long)pthread_self(),
+        g_rank, g_local_rank, g_world_size, kind, kind,
+        stream, stream_index, stream_label,
+        start_ns, end_ns, end_ns - start_ns, ret, count,
+        stream, stream_index, stream_label);
 }
 
 ncclResult_t ncclAllReduce(const void* sendbuff,
@@ -2744,7 +3316,7 @@ ncclResult_t ncclAllReduce(const void* sendbuff,
     long long start = now_ns();
     ncclResult_t ret = real_ncclAllReduce(sendbuff, recvbuff, count, datatype, op, comm, stream);
     long long end = now_ns();
-    send_nccl_event("nccl_all_reduce", count, ret, start, end);
+    send_nccl_event("nccl_all_reduce", count, ret, start, end, stream);
     return ret;
 }
 
@@ -2762,7 +3334,7 @@ ncclResult_t ncclAllGather(const void* sendbuff,
     long long start = now_ns();
     ncclResult_t ret = real_ncclAllGather(sendbuff, recvbuff, sendcount, datatype, comm, stream);
     long long end = now_ns();
-    send_nccl_event("nccl_all_gather", sendcount, ret, start, end);
+    send_nccl_event("nccl_all_gather", sendcount, ret, start, end, stream);
     return ret;
 }
 
@@ -2781,7 +3353,7 @@ ncclResult_t ncclReduceScatter(const void* sendbuff,
     long long start = now_ns();
     ncclResult_t ret = real_ncclReduceScatter(sendbuff, recvbuff, recvcount, datatype, op, comm, stream);
     long long end = now_ns();
-    send_nccl_event("nccl_reduce_scatter", recvcount, ret, start, end);
+    send_nccl_event("nccl_reduce_scatter", recvcount, ret, start, end, stream);
     return ret;
 }
 
@@ -2800,6 +3372,6 @@ ncclResult_t ncclBroadcast(const void* sendbuff,
     long long start = now_ns();
     ncclResult_t ret = real_ncclBroadcast(sendbuff, recvbuff, count, datatype, root, comm, stream);
     long long end = now_ns();
-    send_nccl_event("nccl_broadcast", count, ret, start, end);
+    send_nccl_event("nccl_broadcast", count, ret, start, end, stream);
     return ret;
 }

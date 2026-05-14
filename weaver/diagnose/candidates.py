@@ -150,6 +150,7 @@ class CandidateDiscovery:
                         evidence={
                             "actual_predecessor_id": actual_pred.kid,
                             "actual_predecessor_kernel": actual_pred.kernel_name,
+                            "actual_predecessor_operator": actual_pred.operator_name,
                             "actual_predecessor_family": actual_pred.family,
                             "manual_dependency_ids": [dep.dependency_id for dep in deps],
                             "expected_predecessor_ids": [pred.kid for pred in expected_found],
@@ -216,6 +217,7 @@ class CandidateDiscovery:
                             "predecessor_id": prev.kid,
                             "predecessor_family": prev.family,
                             "predecessor_kernel": prev.kernel_name,
+                            "predecessor_operator": prev.operator_name,
                             "gap_ns": gap,
                         },
                         confidence=0.65,

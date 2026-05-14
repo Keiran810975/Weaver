@@ -116,6 +116,7 @@ class TimelineNormalizer:
         self.kernel_records.sort(key=lambda k: k.gpu_start_ns or k.cpu_enqueue_start_ns or 0)
         self.operator_records.sort(key=lambda o: o.ts_start_ns)
         self.sync_records.sort(key=lambda s: s.ts_start_ns)
+        self._attach_operator_context()
 
         return self.kernel_records, self.operator_records, self.sync_records
 
@@ -163,7 +164,7 @@ class TimelineNormalizer:
         rank = _get(event, "rank")
         pid = _get(event, "pid", 0)
         tid = _get(event, "tid")
-        stream = _get(event, "stream")
+        stream = _get_first(event, ["stream_label", "stream"])
 
         operator_name = _get(event, "operator_name")
         operator_id = _get(event, "operator_id")
@@ -183,6 +184,10 @@ class TimelineNormalizer:
         # CPU 侧时间（来自 hook）
         cpu_enqueue_start_ns = _get_first(event, ["cpu_enqueue_start_ns", "start_ns"])
         cpu_enqueue_end_ns = _get_first(event, ["cpu_enqueue_end_ns", "end_ns"])
+        if cpu_enqueue_start_ns is None:
+            cpu_enqueue_start_ns = _get(event, "ts_ns")
+        if cpu_enqueue_end_ns is None:
+            cpu_enqueue_end_ns = cpu_enqueue_start_ns
 
         # 执行信息
         grid = tuple(_get(event, "grid", [1, 1, 1]))
@@ -269,7 +274,7 @@ class TimelineNormalizer:
         pid = _get(event, "pid", 0)
         phase = _get(event, "phase")
 
-        ts_start_ns = _get_first(event, ["ts_ns", "start_ns"], 0)
+        ts_start_ns = _get_first(event, ["start_ns", "ts_ns"], 0)
         ts_end_ns = _get_first(event, ["ts_end_ns", "end_ns"])
 
         return OperatorRecord(
@@ -301,7 +306,7 @@ class TimelineNormalizer:
         rank = _get(event, "rank")
         pid = _get(event, "pid", 0)
 
-        ts_start_ns = _get_first(event, ["ts_ns", "start_ns"], 0)
+        ts_start_ns = _get_first(event, ["start_ns", "ts_ns"], 0)
         ts_end_ns = _get_first(event, ["ts_end_ns", "end_ns"])
 
         # 提取调用栈
@@ -323,3 +328,52 @@ class TimelineNormalizer:
             source=source,
             payload=payload,
         )
+
+    def _attach_operator_context(self) -> None:
+        """用 host enqueue 时间把低开销 kernel/sync 事件归到最近的 operator scope。"""
+        if not self.operator_records:
+            return
+
+        for kernel in self.kernel_records:
+            timestamp = kernel.cpu_enqueue_start_ns or kernel.gpu_start_ns
+            if timestamp is None:
+                continue
+            op = self._find_containing_operator(timestamp, kernel.rank, kernel.pid)
+            if op is None:
+                continue
+            if not kernel.operator_name:
+                kernel.operator_name = op.operator_name
+            if not kernel.operator_id:
+                kernel.operator_id = op.oid
+            if kernel.kid not in op.kernel_ids:
+                op.kernel_ids.append(kernel.kid)
+
+        for sync in self.sync_records:
+            timestamp = sync.ts_start_ns
+            op = self._find_containing_operator(timestamp, sync.rank, sync.pid)
+            if op is None:
+                continue
+            sync.payload.setdefault("operator_name", op.operator_name)
+            sync.payload.setdefault("operator_id", op.oid)
+
+    def _find_containing_operator(
+        self,
+        timestamp_ns: Optional[int],
+        rank: Optional[int],
+        pid: int,
+    ) -> Optional[OperatorRecord]:
+        if timestamp_ns is None:
+            return None
+        matches = []
+        for op in self.operator_records:
+            if op.pid and pid and op.pid != pid:
+                continue
+            if op.rank is not None and rank is not None and op.rank != rank:
+                continue
+            end_ns = op.ts_end_ns if op.ts_end_ns is not None else op.ts_start_ns
+            if op.ts_start_ns <= timestamp_ns <= end_ns:
+                matches.append(op)
+        if not matches:
+            return None
+        matches.sort(key=lambda item: ((item.ts_end_ns or item.ts_start_ns) - item.ts_start_ns, item.ts_start_ns))
+        return matches[0]

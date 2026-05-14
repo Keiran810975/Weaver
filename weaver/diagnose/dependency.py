@@ -91,6 +91,7 @@ class DependencyLocalizer:
             confidence=confidence,
             evidence={
                 "blocker_name": self._blocker_name(blocker_kind, blocker),
+                "blocker_operator": self._blocker_operator(blocker_kind, blocker),
                 "blocker_family": self._blocker_family(blocker_kind, blocker),
                 "actual_gap_ns": self._compute_gap(target, blocker_kind, blocker),
                 "expected_predecessors": [p.kid for p in expected_preds],
@@ -464,6 +465,11 @@ class DependencyLocalizer:
 
     def _blocker_name(self, blocker_kind: str, blocker: Blocker) -> str:
         return blocker.kernel_name if blocker_kind == "kernel" else blocker.kind.value
+
+    def _blocker_operator(self, blocker_kind: str, blocker: Blocker) -> Optional[str]:
+        if blocker_kind == "kernel":
+            return blocker.operator_name
+        return blocker.payload.get("operator_name") if blocker.payload else None
 
     def _blocker_family(self, blocker_kind: str, blocker: Blocker) -> str:
         return blocker.family if blocker_kind == "kernel" else "SYNC"

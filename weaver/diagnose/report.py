@@ -152,6 +152,11 @@ class DiagnosisReporter:
                         if blocker_kernel is not None
                         else dependency.get("evidence", {}).get("blocker_name")
                     ),
+                    "operator_name": (
+                        blocker_kernel.operator_name
+                        if blocker_kernel is not None
+                        else dependency.get("evidence", {}).get("blocker_operator")
+                    ),
                 }
                 slowdown_estimate_ns = dependency.get("delay_ns")
                 evidence_chain.extend([
@@ -168,6 +173,7 @@ class DiagnosisReporter:
                     "id": culprit_id,
                     "kind": "kernel",
                     "name": culprit_kernel.kernel_name if culprit_kernel is not None else resource.get("evidence", {}).get("culprit_kernel"),
+                    "operator_name": culprit_kernel.operator_name if culprit_kernel is not None else None,
                     "resource_hint": resource.get("resource_hint"),
                 }
                 evidence_chain.extend([
@@ -187,6 +193,7 @@ class DiagnosisReporter:
             root_causes.append({
                 "target_id": target_id,
                 "target_kernel": target.get("kernel_name"),
+                "target_operator": target.get("operator_name"),
                 "target_family": target.get("family"),
                 "abnormal_type": abnormal_type,
                 "root_cause": root,
