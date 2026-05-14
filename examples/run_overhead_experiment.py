@@ -37,6 +37,8 @@ PRESETS = {
         "python_sample_rate": 1,
         "python_event_budget": 1,
         "collection_mode": "selective",
+        "selective_name_sample_rate": 0,
+        "selective_timed_sample_rate": 1,
     },
     "quick": {
         "output_dir": "./overhead_v100_quick",
@@ -55,6 +57,8 @@ PRESETS = {
         "python_sample_rate": 1,
         "python_event_budget": 1,
         "collection_mode": "selective",
+        "selective_name_sample_rate": 0,
+        "selective_timed_sample_rate": 1,
     },
     "paper": {
         "output_dir": "./overhead_out",
@@ -73,6 +77,8 @@ PRESETS = {
         "python_sample_rate": 1,
         "python_event_budget": 1,
         "collection_mode": "selective",
+        "selective_name_sample_rate": 0,
+        "selective_timed_sample_rate": 1,
     },
 }
 
@@ -126,6 +132,16 @@ def parse_args() -> argparse.Namespace:
         help="Weaver CUDA hook collection mode used by hook-enabled modes",
     )
     parser.add_argument(
+        "--selective-name-sample-rate",
+        type=int,
+        help="selective mode: emit one sampled name-only event every N low-value or sampled-out launches; 0 drops them",
+    )
+    parser.add_argument(
+        "--selective-timed-sample-rate",
+        type=int,
+        help="selective mode: time one important kernel every N launches; trigger windows are always fully timed",
+    )
+    parser.add_argument(
         "--kernel-slowdown-target-mode",
         default="weaver_full",
         help="Weaver mode whose per-kernel CUDA Event timings are compared against the reference trace",
@@ -156,6 +172,10 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
             setattr(args, key, value)
     if args.collection_mode is None:
         args.collection_mode = os.environ.get("WEAVER_COLLECTION_MODE", "selective")
+    if args.selective_name_sample_rate is None:
+        args.selective_name_sample_rate = int(os.environ.get("WEAVER_SELECTIVE_NAME_SAMPLE_RATE", "0"))
+    if args.selective_timed_sample_rate is None:
+        args.selective_timed_sample_rate = int(os.environ.get("WEAVER_SELECTIVE_TIMED_SAMPLE_RATE", "1"))
     if args.single_gpu is None:
         args.single_gpu = False
 
@@ -274,6 +294,8 @@ def mode_env(
     python_sample_rate: int,
     python_event_budget: int,
     collection_mode: str,
+    selective_name_sample_rate: int,
+    selective_timed_sample_rate: int,
     trigger_capture_after: int,
     single_gpu: bool,
 ) -> Dict[str, str]:
@@ -308,6 +330,8 @@ def mode_env(
     if needs_hook(mode):
         add_preload(env, HOOK)
         env["WEAVER_COLLECTION_MODE"] = collection_mode
+        env["WEAVER_SELECTIVE_NAME_SAMPLE_RATE"] = str(max(0, selective_name_sample_rate))
+        env["WEAVER_SELECTIVE_TIMED_SAMPLE_RATE"] = str(max(0, selective_timed_sample_rate))
         env["WEAVER_TRIGGER_CAPTURE_AFTER"] = str(max(0, trigger_capture_after))
         env.setdefault("WEAVER_CUDA_EVENTS", "1")
         env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
@@ -511,6 +535,8 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
             args.python_sample_rate,
             args.python_event_budget,
             args.collection_mode,
+            args.selective_name_sample_rate,
+            args.selective_timed_sample_rate,
             args.trigger_capture_after,
             args.single_gpu,
         )
@@ -1005,7 +1031,7 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
         "method": {
             "preset": args.preset,
             "baseline": "same workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
-            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; the default selective CUDA hook records GPU start/end for diagnostic-critical kernels and records low-value kernels by name only",
+            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; the default selective CUDA hook records GPU start/end for diagnostic-critical kernels and samples or drops low-value name-only records",
             "steady_state": "warmup iterations are excluded from step-level overhead; kernel slowdown uses timed kernel_launch events written by the hook",
             "primary_metric": "median host_step_ms overhead vs baseline",
             "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes", "per_kernel_gpu_duration_slowdown"],
@@ -1049,6 +1075,7 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "",
         "Warmup iterations are excluded from the steady-state overhead calculation.",
         f"CUDA collection mode: `{summary['config'].get('collection_mode')}`.",
+        f"Selective name sample rate: `{summary['config'].get('selective_name_sample_rate')}`; timed sample rate: `{summary['config'].get('selective_timed_sample_rate')}`.",
         "",
         "| mode | host median ms | GPU median ms | host overhead | GPU overhead | host p95 ms | Weaver events | Weaver MB |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -1056,7 +1083,7 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "",
         "Interpretation:",
         "- The main claim should use `weaver_full` host median overhead versus `baseline`.",
-        "- Default Weaver modes use selective CUDA Event timing: GEMM/NCCL/memcpy/layout kernels are timed, while low-value high-frequency kernels are name-only.",
+        "- Default Weaver modes use selective CUDA Event timing: GEMM/NCCL/memcpy/layout kernels are timed, while low-value high-frequency name-only records are sampled or dropped.",
         "- Per-kernel slowdown is written to `kernel_slowdown.json` and `kernel_slowdown.md`.",
         "- `torch_profiler` is a reference diagnostic tool; the normal Weaver path should be below it.",
     ]

@@ -37,7 +37,9 @@ Useful environment knobs:
 - `WEAVER_PYTHON_EVENT_BUDGET`: stop and unload the CPython profile callback after N emitted Python events. The low-overhead launcher defaults to `1`; use `0` for an unlimited/full Python trace during deep diagnosis.
 - `WEAVER_TRACE_GC=0/1`: disable or enable Python GC pause events.
 - `WEAVER_ENABLE_DISASM=1`: opt into loaded GPU code capture and the Neutrino-style disassembly sidecar. Default is `0` for the low-overhead normal path.
-- `WEAVER_COLLECTION_MODE=selective`: record GEMM/NCCL/memcpy/layout kernels with CUDA Event GPU start/end, while high-frequency low-value kernels stay name-only. Use `adaptive_name` for sketch-triggered timing windows, `full` for the older all-kernel timing path, or `name_only` for names only.
+- `WEAVER_COLLECTION_MODE=selective`: record GEMM/NCCL/memcpy/layout kernels with CUDA Event GPU start/end, while high-frequency low-value kernels are sampled as name-only or dropped. Use `adaptive_name` for sketch-triggered timing windows, `full` for the older all-kernel timing path, or `name_only` for names only.
+- `WEAVER_SELECTIVE_NAME_SAMPLE_RATE=10`: in selective mode, emit one name-only record every N low-value or sampled-out launches. Use `0` to drop them for the lowest-overhead path.
+- `WEAVER_SELECTIVE_TIMED_SAMPLE_RATE=1`: in selective mode, time one important kernel every N important launches. Triggered anomaly windows are always timed fully.
 - `WEAVER_SELECTIVE_TIMED_REDUCTION=1`: in selective mode, also time reduction/norm/softmax-style kernels. Default is name-only for lower overhead.
 - `WEAVER_SELECTIVE_UNKNOWN_FULL=1`: in selective mode, time unknown/runtime kernels. Default is name-only because these are often short and frequent.
 - `WEAVER_EXPECTED_KERNELS`: semicolon/comma-separated expected kernel patterns. Prefix entries with `exact:` or `regex:` when needed; unprefixed entries are substring matches.
