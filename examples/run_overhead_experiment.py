@@ -308,6 +308,7 @@ def mode_env(
     if needs_hook(mode):
         add_preload(env, HOOK)
         env["WEAVER_COLLECTION_MODE"] = collection_mode
+        env.setdefault("WEAVER_SELECTIVE_DROP_LOW_VALUE", "1")
         env["WEAVER_TRIGGER_CAPTURE_AFTER"] = str(max(0, trigger_capture_after))
         env.setdefault("WEAVER_CUDA_EVENTS", "1")
         env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
@@ -1005,7 +1006,7 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
         "method": {
             "preset": args.preset,
             "baseline": "same workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
-            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; the default selective CUDA hook records GPU start/end for diagnostic-critical kernels and records low-value kernels by name only",
+            "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; the default selective CUDA hook records GPU start/end for GEMM/NCCL/sync, records metadata-useful kernels by name only, and drops very low-value launches",
             "steady_state": "warmup iterations are excluded from step-level overhead; kernel slowdown uses timed kernel_launch events written by the hook",
             "primary_metric": "median host_step_ms overhead vs baseline",
             "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes", "per_kernel_gpu_duration_slowdown"],
@@ -1056,7 +1057,7 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "",
         "Interpretation:",
         "- The main claim should use `weaver_full` host median overhead versus `baseline`.",
-        "- Default Weaver modes use selective CUDA Event timing: GEMM/NCCL/memcpy/layout kernels are timed, while low-value high-frequency kernels are name-only.",
+        "- Default Weaver modes use selective CUDA Event timing: GEMM/NCCL/sync are timed, metadata-useful kernels are name-only, and very low-value high-frequency kernels are dropped.",
         "- Per-kernel slowdown is written to `kernel_slowdown.json` and `kernel_slowdown.md`.",
         "- `torch_profiler` is a reference diagnostic tool; the normal Weaver path should be below it.",
     ]
