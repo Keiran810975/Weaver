@@ -8,5 +8,6 @@ weaver_events.ndjson
 
 # Python cache
 __pycache__/
+hooks/libweaver_hook.so
 weaver/collector/_native_py_trace*.so
 weaver/collector/_native_py_trace*.dylib
