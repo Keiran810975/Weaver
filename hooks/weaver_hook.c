@@ -185,7 +185,6 @@ struct expected_kernel_pattern {
 
 struct launch_capture_decision {
     int full_timing;
-    int emit_name_only;
     int matched_expected;
     int triggered;
     unsigned long stream_index;
@@ -333,12 +332,6 @@ static unsigned long g_trigger_window_remaining = 0;
 static int g_trigger_unknown = 0;
 static int g_selective_timed_reduction = 0;
 static int g_selective_unknown_full = 0;
-static int g_selective_name_sample_rate = 10;
-static int g_selective_timed_sample_rate = 1;
-static unsigned long long g_selective_name_seen = 0;
-static unsigned long long g_selective_name_emitted = 0;
-static unsigned long long g_selective_important_seen = 0;
-static unsigned long long g_selective_important_timed = 0;
 static int g_sequence_repeat = 1;
 static int g_rank = -1;
 static int g_local_rank = -1;
@@ -794,42 +787,6 @@ static int kernel_should_full_time_selective(const char* kernel_name) {
     return !kernel_is_low_value_for_selective(kernel_name);
 }
 
-static int sample_counter_accepts(unsigned long long* counter, int sample_rate) {
-    unsigned long long seen = __sync_add_and_fetch(counter, 1ULL);
-    if (sample_rate <= 0) {
-        return 0;
-    }
-    if (sample_rate == 1) {
-        return 1;
-    }
-    return ((seen - 1ULL) % (unsigned long long)sample_rate) == 0ULL;
-}
-
-static int selective_should_emit_name_only(void) {
-    int emit = sample_counter_accepts(&g_selective_name_seen, g_selective_name_sample_rate);
-    if (emit) {
-        __sync_add_and_fetch(&g_selective_name_emitted, 1ULL);
-    }
-    return emit;
-}
-
-static int selective_should_time_important(void) {
-    int timed = sample_counter_accepts(&g_selective_important_seen, g_selective_timed_sample_rate);
-    if (timed) {
-        __sync_add_and_fetch(&g_selective_important_timed, 1ULL);
-    }
-    return timed;
-}
-
-static void configure_selective_name_only(struct launch_capture_decision* decision,
-                                          const char* reason) {
-    decision->full_timing = 0;
-    decision->emit_name_only = selective_should_emit_name_only();
-    snprintf(decision->capture_mode, sizeof(decision->capture_mode),
-             decision->emit_name_only ? "selective_name_sampled" : "selective_name_dropped");
-    snprintf(decision->trigger_reason, sizeof(decision->trigger_reason), "%s", reason);
-}
-
 static void open_adaptive_trigger_window(void) {
     if ((g_collection_mode != COLLECTION_ADAPTIVE_NAME &&
          g_collection_mode != COLLECTION_SELECTIVE) ||
@@ -846,7 +803,6 @@ static void open_adaptive_trigger_window(void) {
 static struct launch_capture_decision choose_launch_capture(const char* kernel_name, void* stream) {
     struct launch_capture_decision decision;
     memset(&decision, 0, sizeof(decision));
-    decision.emit_name_only = 1;
     decision.stream_index = stream_index_for(stream);
     snprintf(decision.stream_label, sizeof(decision.stream_label), "s%lu", decision.stream_index);
 
@@ -894,21 +850,15 @@ static struct launch_capture_decision choose_launch_capture(const char* kernel_n
             snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "after_unexpected_kernel");
         } else if (g_collection_mode == COLLECTION_SELECTIVE &&
                    kernel_should_full_time_selective(kernel_name)) {
-            if (selective_should_time_important()) {
-                decision.full_timing = 1;
-                snprintf(decision.capture_mode, sizeof(decision.capture_mode), "selective_full");
-                snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "selective_important_kernel");
-            } else {
-                configure_selective_name_only(&decision, "selective_important_sampled_out");
-            }
+            decision.full_timing = 1;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "selective_full");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "selective_important_kernel");
         } else {
-            if (g_collection_mode == COLLECTION_SELECTIVE) {
-                configure_selective_name_only(&decision, "selective_low_value_kernel");
-            } else {
-                decision.full_timing = 0;
-                snprintf(decision.capture_mode, sizeof(decision.capture_mode), "name_only");
-                snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "matched_sequence_node");
-            }
+            decision.full_timing = 0;
+            snprintf(decision.capture_mode, sizeof(decision.capture_mode),
+                     g_collection_mode == COLLECTION_SELECTIVE ? "selective_name_only" : "name_only");
+            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason),
+                     g_collection_mode == COLLECTION_SELECTIVE ? "selective_low_value_kernel" : "matched_sequence_node");
         }
         pthread_mutex_unlock(&g_adaptive_lock);
         return decision;
@@ -944,21 +894,15 @@ static struct launch_capture_decision choose_launch_capture(const char* kernel_n
         snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "after_unexpected_kernel");
     } else if (g_collection_mode == COLLECTION_SELECTIVE &&
                kernel_should_full_time_selective(kernel_name)) {
-        if (selective_should_time_important()) {
-            decision.full_timing = 1;
-            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "selective_full");
-            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "selective_important_kernel");
-        } else {
-            configure_selective_name_only(&decision, "selective_important_sampled_out");
-        }
+        decision.full_timing = 1;
+        snprintf(decision.capture_mode, sizeof(decision.capture_mode), "selective_full");
+        snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "selective_important_kernel");
     } else {
-        if (g_collection_mode == COLLECTION_SELECTIVE) {
-            configure_selective_name_only(&decision, "selective_low_value_kernel");
-        } else {
-            decision.full_timing = 0;
-            snprintf(decision.capture_mode, sizeof(decision.capture_mode), "name_only");
-            snprintf(decision.trigger_reason, sizeof(decision.trigger_reason), "matched_expected_kernel");
-        }
+        decision.full_timing = 0;
+        snprintf(decision.capture_mode, sizeof(decision.capture_mode),
+                 g_collection_mode == COLLECTION_SELECTIVE ? "selective_name_only" : "name_only");
+        snprintf(decision.trigger_reason, sizeof(decision.trigger_reason),
+                 g_collection_mode == COLLECTION_SELECTIVE ? "selective_low_value_kernel" : "matched_expected_kernel");
     }
     pthread_mutex_unlock(&g_adaptive_lock);
     return decision;
@@ -2325,14 +2269,6 @@ static void init_runtime(void) {
     g_trigger_unknown = env_flag("WEAVER_TRIGGER_UNKNOWN_KERNELS", 0);
     g_selective_timed_reduction = env_flag("WEAVER_SELECTIVE_TIMED_REDUCTION", 0);
     g_selective_unknown_full = env_flag("WEAVER_SELECTIVE_UNKNOWN_FULL", 0);
-    g_selective_name_sample_rate = env_int("WEAVER_SELECTIVE_NAME_SAMPLE_RATE", 10);
-    if (g_selective_name_sample_rate < 0) {
-        g_selective_name_sample_rate = 10;
-    }
-    g_selective_timed_sample_rate = env_int("WEAVER_SELECTIVE_TIMED_SAMPLE_RATE", 1);
-    if (g_selective_timed_sample_rate < 0) {
-        g_selective_timed_sample_rate = 1;
-    }
     g_sequence_repeat = env_flag("WEAVER_SEQUENCE_REPEAT", 1);
     parse_expected_kernel_list(getenv("WEAVER_EXPECTED_KERNELS"), 0);
     parse_expected_kernel_list(getenv("WEAVER_EXPECTED_KERNEL_REGEX"), 1);
@@ -2359,7 +2295,7 @@ static void init_runtime(void) {
     }
 
     send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"collection_mode\":\"%s\",\"expected_kernel_patterns\":%lu,\"expected_sequence_nodes\":%lu,\"sequence_repeat\":%s,\"trigger_capture_after\":%lu,\"trigger_unknown_kernels\":%s,\"selective_timed_reduction\":%s,\"selective_unknown_full\":%s,\"selective_name_sample_rate\":%d,\"selective_timed_sample_rate\":%d,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"async_launch_emit\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
+        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"hook\",\"kind\":\"init\",\"payload\":{\"status\":\"ok\",\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"cuda_events\":%s,\"sync_stream_anchor\":%s,\"cuda_event_pool\":%s,\"collection_mode\":\"%s\",\"expected_kernel_patterns\":%lu,\"expected_sequence_nodes\":%lu,\"sequence_repeat\":%s,\"trigger_capture_after\":%lu,\"trigger_unknown_kernels\":%s,\"selective_timed_reduction\":%s,\"selective_unknown_full\":%s,\"patch_dlsym\":%s,\"patch_getproc\":%s,\"disasm\":%s,\"emit_code_events\":%s,\"async_launch_emit\":%s,\"has_cuLaunchKernel\":%s,\"has_cudaLaunchKernel\":%s,\"has_cuGetProcAddress\":%s,\"has_ncclAllReduce\":%s}}",
         now_ns(), getpid(), (unsigned long long)pthread_self(),
         g_rank, g_local_rank, g_world_size,
         g_rank, g_local_rank, g_world_size,
@@ -2375,8 +2311,6 @@ static void init_runtime(void) {
         g_trigger_unknown ? "true" : "false",
         g_selective_timed_reduction ? "true" : "false",
         g_selective_unknown_full ? "true" : "false",
-        g_selective_name_sample_rate,
-        g_selective_timed_sample_rate,
         g_patch_dlsym ? "true" : "false",
         g_patch_getproc ? "true" : "false",
         g_disasm_enabled ? "true" : "false",
@@ -2396,30 +2330,7 @@ __attribute__((constructor)) static void weaver_init(void) {
     init_once();
 }
 
-static void emit_selective_collection_summary(void) {
-    if (g_collection_mode != COLLECTION_SELECTIVE) {
-        return;
-    }
-    unsigned long long name_seen = g_selective_name_seen;
-    unsigned long long name_emitted = g_selective_name_emitted;
-    unsigned long long important_seen = g_selective_important_seen;
-    unsigned long long important_timed = g_selective_important_timed;
-    send_json(
-        "{\"ts_ns\":%lld,\"pid\":%d,\"tid\":%llu,\"rank\":%d,\"local_rank\":%d,\"world_size\":%d,\"layer\":\"hook\",\"kind\":\"selective_collection_summary\",\"payload\":{\"collection_mode\":\"selective\",\"selective_name_sample_rate\":%d,\"selective_timed_sample_rate\":%d,\"name_only_seen\":%llu,\"name_only_emitted\":%llu,\"name_only_dropped\":%llu,\"important_seen\":%llu,\"important_timed\":%llu,\"important_sampled_out\":%llu}}",
-        now_ns(), getpid(), (unsigned long long)pthread_self(),
-        g_rank, g_local_rank, g_world_size,
-        g_selective_name_sample_rate,
-        g_selective_timed_sample_rate,
-        name_seen,
-        name_emitted,
-        name_seen >= name_emitted ? name_seen - name_emitted : 0ULL,
-        important_seen,
-        important_timed,
-        important_seen >= important_timed ? important_seen - important_timed : 0ULL);
-}
-
 __attribute__((destructor)) static void weaver_fini(void) {
-    emit_selective_collection_summary();
     g_should_run = 0;
     pthread_cond_broadcast(&g_queue_cond);
     if (g_poller_started) {
@@ -2647,10 +2558,8 @@ static CUresult handle_launch(CUfunction f,
 	        CUresult ret = launcher(f, gridDimX, gridDimY, gridDimZ,
 	                                blockDimX, blockDimY, blockDimZ,
 	                                sharedMemBytes, hStream, kernelParams, extra);
-	        if (decision.emit_name_only) {
-	            emit_kernel_name_only(name, hStream, __sync_add_and_fetch(&g_launch_seq, 1),
-	                                  ret, &decision);
-	        }
+	        emit_kernel_name_only(name, hStream, __sync_add_and_fetch(&g_launch_seq, 1),
+	                              ret, &decision);
 	        free(name);
 	        return ret;
 	    }
@@ -2791,10 +2700,8 @@ static CUresult handle_launch_ex(const CUlaunchConfig* config,
 	    struct launch_capture_decision decision = choose_launch_capture(name, config->hStream);
 	    if (!decision.full_timing) {
 	        CUresult ret = launcher(config, f, kernelParams, extra);
-	        if (decision.emit_name_only) {
-	            emit_kernel_name_only(name, config->hStream, __sync_add_and_fetch(&g_launch_seq, 1),
-	                                  ret, &decision);
-	        }
+	        emit_kernel_name_only(name, config->hStream, __sync_add_and_fetch(&g_launch_seq, 1),
+	                              ret, &decision);
 	        free(name);
 	        return ret;
 	    }
@@ -2908,10 +2815,8 @@ static cudaError_t handle_runtime_launch(const void* func,
 	    struct launch_capture_decision decision = choose_launch_capture(name, stream);
 	    if (!decision.full_timing) {
 	        cudaError_t ret = launcher(func, gridDim, blockDim, args, sharedMem, stream);
-	        if (decision.emit_name_only) {
-	            emit_kernel_name_only(name, stream, __sync_add_and_fetch(&g_launch_seq, 1),
-	                                  ret, &decision);
-	        }
+	        emit_kernel_name_only(name, stream, __sync_add_and_fetch(&g_launch_seq, 1),
+	                              ret, &decision);
 	        free(name);
 	        return ret;
 	    }
@@ -3072,10 +2977,8 @@ static cudaError_t handle_runtime_launch_ex(const cudaLaunchConfig_runtime* conf
 	    struct launch_capture_decision decision = choose_launch_capture(name, config->stream);
 	    if (!decision.full_timing) {
 	        cudaError_t ret = launcher(config, func, args);
-	        if (decision.emit_name_only) {
-	            emit_kernel_name_only(name, config->stream, __sync_add_and_fetch(&g_launch_seq, 1),
-	                                  ret, &decision);
-	        }
+	        emit_kernel_name_only(name, config->stream, __sync_add_and_fetch(&g_launch_seq, 1),
+	                              ret, &decision);
 	        free(name);
 	        return ret;
 	    }
