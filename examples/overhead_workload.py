@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -93,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profiler-record-shapes", action="store_true")
     parser.add_argument("--profiler-profile-memory", action="store_true")
     parser.add_argument("--profiler-with-stack", action="store_true")
+    parser.add_argument(
+        "--inject-extra-kernel",
+        action="store_true",
+        help="insert a deterministic layout/copy kernel in every step for adaptive-trigger overhead tests",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +181,26 @@ def timed_region(fn, stream: torch.cuda.Stream) -> float:
     return event_elapsed(start, end)
 
 
+def env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) in ("1", "true", "TRUE", "on", "ON")
+
+
+def parse_signal_number(value: str) -> int:
+    text = str(value or "SIGUSR1").strip()
+    if text.isdigit():
+        return int(text)
+    name = text.upper()
+    if not name.startswith("SIG"):
+        name = "SIG" + name
+    return int(getattr(signal, name))
+
+
+def maybe_emit_synthetic_adaptive_trigger() -> None:
+    if not env_flag("WEAVER_SYNTHETIC_ADAPTIVE_PY_TRIGGER", "0"):
+        return
+    os.kill(os.getpid(), parse_signal_number(os.environ.get("WEAVER_ADAPTIVE_PY_SIGNAL", "SIGUSR1")))
+
+
 def make_inputs(args: argparse.Namespace, device: torch.device) -> torch.Tensor:
     return torch.randn(args.batch_size, args.seq_len, args.dim, device=device)
 
@@ -197,6 +223,7 @@ def overhead_train_step(
     x: torch.Tensor,
     y: torch.Tensor,
     comm_buffer: Optional[torch.Tensor],
+    inject_extra_kernel: bool = False,
 ) -> Dict[str, float]:
     stream = torch.cuda.current_stream()
     optimizer.zero_grad(set_to_none=True)
@@ -206,6 +233,10 @@ def overhead_train_step(
     def _forward():
         with torch.profiler.record_function("weaver_overhead_forward"):
             out = model(x)
+            if inject_extra_kernel:
+                with torch.profiler.record_function("weaver_overhead_extra_layout"):
+                    holder["extra_layout"] = out.transpose(1, 2).contiguous()
+                maybe_emit_synthetic_adaptive_trigger()
             holder["loss"] = F.mse_loss(out, y)
 
     forward_ms = timed_region(_forward, stream)
@@ -322,13 +353,16 @@ def main() -> None:
             "profiler_record_shapes": args.profiler_record_shapes,
             "profiler_profile_memory": args.profiler_profile_memory,
             "profiler_with_stack": args.profiler_with_stack,
+            "inject_extra_kernel": args.inject_extra_kernel,
         },
         "env": {
             "WEAVER_AUTO_PROFILE": os.environ.get("WEAVER_AUTO_PROFILE", ""),
+            "WEAVER_PYTHON_ADAPTIVE": os.environ.get("WEAVER_PYTHON_ADAPTIVE", ""),
             "WEAVER_PYTHON_EVENT_BUDGET": os.environ.get("WEAVER_PYTHON_EVENT_BUDGET", ""),
             "WEAVER_CUDA_EVENTS": os.environ.get("WEAVER_CUDA_EVENTS", ""),
             "WEAVER_ENABLE_DISASM": os.environ.get("WEAVER_ENABLE_DISASM", ""),
             "WEAVER_CUDA_SYNC_ANCHOR": os.environ.get("WEAVER_CUDA_SYNC_ANCHOR", ""),
+            "WEAVER_SYNTHETIC_ADAPTIVE_PY_TRIGGER": os.environ.get("WEAVER_SYNTHETIC_ADAPTIVE_PY_TRIGGER", ""),
         },
     }
     with (rank_dir / "metadata.json").open("w", encoding="utf-8") as f:
@@ -356,7 +390,7 @@ def main() -> None:
             step_end = torch.cuda.Event(enable_timing=True)
             host_start = time.perf_counter_ns()
             step_start.record()
-            parts = overhead_train_step(model, optimizer, x, y, comm_buffer)
+            parts = overhead_train_step(model, optimizer, x, y, comm_buffer, args.inject_extra_kernel)
             step_end.record()
             torch.cuda.synchronize()
             host_end = time.perf_counter_ns()

@@ -16,7 +16,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD = ROOT / "examples" / "overhead_workload.py"
 HOOK = ROOT / "hooks" / "libweaver_hook.so"
-RUNNER_VERSION = "selective_kernel_timing_slowdown_v1"
+RUNNER_VERSION = "adaptive_python_neutrino_overhead_v1"
 
 PRESETS = {
     "single_gpu_quick": {
@@ -37,6 +37,28 @@ PRESETS = {
         "python_sample_rate": 1,
         "python_event_budget": 1,
         "collection_mode": "selective",
+        "inject_extra_kernel": False,
+    },
+    "single_gpu_adaptive": {
+        "output_dir": "./overhead_single_gpu_adaptive",
+        "modes": "baseline,weaver_kernel_only,weaver_triggered_py_only,weaver_neutrino_warp_only,weaver_adaptive_neutrino_full,torch_profiler",
+        "repeats": 1,
+        "nproc_per_node": 1,
+        "single_gpu": True,
+        "warmup": 5,
+        "iters": 50,
+        "batch_size": 4,
+        "seq_len": 256,
+        "dim": 512,
+        "hidden_dim": 2048,
+        "layers": 3,
+        "explicit_comm_mb": 0,
+        "profiler_active": 5,
+        "python_sample_rate": 1,
+        "python_event_budget": 0,
+        "collection_mode": "selective",
+        "inject_extra_kernel": True,
+        "kernel_slowdown_target_mode": "weaver_adaptive_neutrino_full",
     },
     "quick": {
         "output_dir": "./overhead_v100_quick",
@@ -55,6 +77,27 @@ PRESETS = {
         "python_sample_rate": 1,
         "python_event_budget": 1,
         "collection_mode": "selective",
+        "inject_extra_kernel": False,
+    },
+    "adaptive_quick": {
+        "output_dir": "./overhead_v100_adaptive",
+        "modes": "baseline,weaver_kernel_only,weaver_triggered_py_only,weaver_neutrino_warp_only,weaver_adaptive_neutrino_full,torch_profiler",
+        "repeats": 1,
+        "nproc_per_node": 2,
+        "warmup": 5,
+        "iters": 50,
+        "batch_size": 4,
+        "seq_len": 256,
+        "dim": 512,
+        "hidden_dim": 2048,
+        "layers": 3,
+        "explicit_comm_mb": 16,
+        "profiler_active": 5,
+        "python_sample_rate": 1,
+        "python_event_budget": 0,
+        "collection_mode": "selective",
+        "inject_extra_kernel": True,
+        "kernel_slowdown_target_mode": "weaver_adaptive_neutrino_full",
     },
     "paper": {
         "output_dir": "./overhead_out",
@@ -73,6 +116,7 @@ PRESETS = {
         "python_sample_rate": 1,
         "python_event_budget": 1,
         "collection_mode": "selective",
+        "inject_extra_kernel": False,
     },
 }
 
@@ -105,6 +149,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--explicit-comm-mb", type=int)
     parser.add_argument("--base-http-port", type=int, default=18770)
     parser.add_argument("--profiler-active", type=int)
+    parser.add_argument(
+        "--inject-extra-kernel",
+        action="store_true",
+        default=None,
+        help="insert the same extra layout/copy kernel in every mode so adaptive Python triggers have a real extra kernel to react to",
+    )
     parser.add_argument("--profiler-record-shapes", action="store_true")
     parser.add_argument("--profiler-profile-memory", action="store_true")
     parser.add_argument("--profiler-with-stack", action="store_true")
@@ -127,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--kernel-slowdown-target-mode",
-        default="weaver_full",
+        default=None,
         help="Weaver mode whose per-kernel CUDA Event timings are compared against the reference trace",
     )
     parser.add_argument(
@@ -158,6 +208,8 @@ def apply_preset_defaults(args: argparse.Namespace) -> None:
         args.collection_mode = os.environ.get("WEAVER_COLLECTION_MODE", "selective")
     if args.single_gpu is None:
         args.single_gpu = False
+    if args.kernel_slowdown_target_mode is None:
+        args.kernel_slowdown_target_mode = "weaver_full"
 
 
 def percentile(values: List[float], pct: float) -> float:
@@ -183,11 +235,33 @@ def summarize(values: List[float]) -> Dict[str, float]:
 
 def split_modes(text: str) -> List[str]:
     modes = [m.strip() for m in text.split(",") if m.strip()]
-    valid = {"baseline", "weaver_full", "weaver_no_disasm", "weaver_kernel_only", "weaver_py_only", "torch_profiler"}
+    valid = {
+        "baseline",
+        "weaver_full",
+        "weaver_no_disasm",
+        "weaver_kernel_only",
+        "weaver_py_only",
+        "weaver_triggered_py_only",
+        "weaver_neutrino_warp_only",
+        "weaver_adaptive_neutrino_full",
+        "torch_profiler",
+    }
     unknown = sorted(set(modes) - valid)
     if unknown:
         raise ValueError(f"unknown modes: {unknown}; valid={sorted(valid)}")
     return modes
+
+
+def is_classic_python_profile_mode(mode: str) -> bool:
+    return mode in {"weaver_full", "weaver_no_disasm", "weaver_py_only"}
+
+
+def is_adaptive_python_mode(mode: str) -> bool:
+    return mode in {"weaver_triggered_py_only", "weaver_adaptive_neutrino_full"}
+
+
+def is_neutrino_warp_mode(mode: str) -> bool:
+    return mode in {"weaver_neutrino_warp_only", "weaver_adaptive_neutrino_full"}
 
 
 def prepend_path(env: Dict[str, str], key: str, value: str, sep: str = os.pathsep) -> None:
@@ -217,7 +291,13 @@ def native_python_trace_path(python: str) -> Path:
     return ROOT / "weaver" / "collector" / f"_native_py_trace{suffix}"
 
 
-def start_daemon(python: str, sock: Path, out_file: Path, http_port: int) -> subprocess.Popen:
+def start_daemon(
+    python: str,
+    sock: Path,
+    out_file: Path,
+    http_port: int,
+    adaptive_python_signal: bool = False,
+) -> subprocess.Popen:
     cmd = [
         python,
         "-m",
@@ -231,6 +311,10 @@ def start_daemon(python: str, sock: Path, out_file: Path, http_port: int) -> sub
     ]
     env = os.environ.copy()
     prepend_path(env, "PYTHONPATH", str(ROOT))
+    if adaptive_python_signal:
+        env["WEAVER_DAEMON_ADAPTIVE_PY_SIGNAL"] = "1"
+        env.setdefault("WEAVER_ADAPTIVE_PY_SIGNAL", "SIGUSR1")
+        env.setdefault("WEAVER_ADAPTIVE_PY_SIGNAL_MIN_INTERVAL_NS", "0")
     out_file.parent.mkdir(parents=True, exist_ok=True)
     return subprocess.Popen(cmd, cwd=str(ROOT), env=env)
 
@@ -262,7 +346,13 @@ def needs_daemon(mode: str) -> bool:
 
 
 def needs_hook(mode: str) -> bool:
-    return mode in {"weaver_full", "weaver_no_disasm", "weaver_kernel_only"}
+    return mode in {
+        "weaver_full",
+        "weaver_no_disasm",
+        "weaver_kernel_only",
+        "weaver_neutrino_warp_only",
+        "weaver_adaptive_neutrino_full",
+    }
 
 
 def mode_env(
@@ -293,17 +383,30 @@ def mode_env(
     if sock is not None:
         env["WEAVER_SOCK"] = str(sock)
 
-    if mode in {"weaver_full", "weaver_no_disasm", "weaver_py_only"}:
+    if is_classic_python_profile_mode(mode):
         env["WEAVER_AUTO_PROFILE"] = "1"
         env["WEAVER_PYTHON_COLLECTOR"] = "native"
         env["WEAVER_REQUIRE_NATIVE_PY"] = "1"
         env.setdefault(
             "WEAVER_PYTHON_TRACE_FUNCS",
-            "overhead_train_step,OverheadBlock.forward,weaver_overhead_forward,weaver_overhead_backward,weaver_overhead_optimizer",
+            "overhead_train_step,_forward,_backward,_optimizer,OverheadBlock.forward,weaver_overhead_forward,weaver_overhead_backward,weaver_overhead_optimizer",
         )
         env.setdefault("WEAVER_PYTHON_SAMPLE_RATE", str(max(1, python_sample_rate)))
         env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", str(max(0, python_event_budget)))
         env.setdefault("WEAVER_TRACE_GC", "0")
+
+    if is_adaptive_python_mode(mode):
+        env["WEAVER_AUTO_PROFILE"] = "1"
+        env["WEAVER_PYTHON_ADAPTIVE"] = "1"
+        env.setdefault("WEAVER_ADAPTIVE_PY_SIGNAL", "SIGUSR1")
+        env.setdefault(
+            "WEAVER_PYTHON_TRACE_FUNCS",
+            "overhead_train_step,_forward,_backward,_optimizer,OverheadBlock.forward,weaver_overhead_forward,weaver_overhead_backward,weaver_overhead_optimizer",
+        )
+        env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", str(max(0, python_event_budget)))
+        env.setdefault("WEAVER_TRACE_GC", "0")
+        if mode == "weaver_triggered_py_only":
+            env["WEAVER_SYNTHETIC_ADAPTIVE_PY_TRIGGER"] = "1"
 
     if needs_hook(mode):
         add_preload(env, HOOK)
@@ -320,6 +423,49 @@ def mode_env(
         env["WEAVER_TRACE_DIR"] = str(run_dir / "captured_kernels")
         env.setdefault("WEAVER_ENABLE_DISASM", "0")
         env["WEAVER_PYTHON"] = python
+        if mode == "weaver_adaptive_neutrino_full":
+            env.setdefault(
+                "WEAVER_EXPECTED_KERNELS",
+                ",".join(
+                    [
+                        "gemm",
+                        "sgemm",
+                        "dgemm",
+                        "hgemm",
+                        "matmul",
+                        "cublas",
+                        "cutlass",
+                        "nccl",
+                        "allreduce",
+                        "all_reduce",
+                        "reduce",
+                        "reduction",
+                        "layer_norm",
+                        "layernorm",
+                        "softmax",
+                        "sum",
+                        "mean",
+                        "elementwise",
+                        "CUDAFunctor",
+                        "Gelu",
+                        "gelu",
+                        "Silu",
+                        "silu",
+                        "mse",
+                        "FillFunctor",
+                        "fill",
+                        "zero",
+                        "Foreach",
+                        "foreach",
+                        "multi_tensor_apply",
+                        "Adam",
+                        "adam",
+                    ]
+                ),
+            )
+        if is_neutrino_warp_mode(mode):
+            env["WEAVER_ENABLE_DISASM"] = "1"
+            env["WEAVER_EMIT_CODE_EVENTS"] = "1"
 
     return env
 
@@ -363,6 +509,8 @@ def workload_cmd(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -
             str(args.explicit_comm_mb),
         ]
     )
+    if args.inject_extra_kernel:
+        cmd.append("--inject-extra-kernel")
     if mode == "torch_profiler":
         cmd.append("--torch-profiler")
         cmd.extend(["--profiler-active", str(args.profiler_active)])
@@ -462,7 +610,13 @@ def validate_weaver_event_coverage(mode: str, events: Dict[str, object], log_pat
             if tail:
                 detail += f"\n--- torchrun.log tail ---\n{tail}"
             raise RuntimeError(detail)
-        if mode in {"weaver_full", "weaver_no_disasm", "weaver_kernel_only"}:
+        if mode in {
+            "weaver_full",
+            "weaver_no_disasm",
+            "weaver_kernel_only",
+            "weaver_neutrino_warp_only",
+            "weaver_adaptive_neutrino_full",
+        }:
             if int(by_kind.get("kernel_launch", 0)) <= 0:
                 tail = read_log_tail(log_path)
                 detail = (
@@ -481,7 +635,14 @@ def validate_weaver_event_coverage(mode: str, events: Dict[str, object], log_pat
                 if tail:
                     detail += f"\n--- torchrun.log tail ---\n{tail}"
                 raise RuntimeError(detail)
-    if mode in {"weaver_full", "weaver_no_disasm", "weaver_py_only"}:
+    if is_neutrino_warp_mode(mode):
+        if int(by_layer.get("neutrino", 0)) <= 0:
+            tail = read_log_tail(log_path)
+            detail = f"{mode} produced no Neutrino/disassembly layer events"
+            if tail:
+                detail += f"\n--- torchrun.log tail ---\n{tail}"
+            raise RuntimeError(detail)
+    if is_classic_python_profile_mode(mode) or is_adaptive_python_mode(mode):
         if int(by_layer.get("python", 0)) <= 0:
             tail = read_log_tail(log_path)
             detail = f"{mode} produced no Python operator events"
@@ -500,7 +661,13 @@ def run_one(args: argparse.Namespace, mode: str, rep: int, out_dir: Path) -> Dic
     daemon = None
     try:
         if needs_daemon(mode):
-            daemon = start_daemon(args.python, sock, weaver_file, args.base_http_port + rep)
+            daemon = start_daemon(
+                args.python,
+                sock,
+                weaver_file,
+                args.base_http_port + rep,
+                adaptive_python_signal=(mode == "weaver_adaptive_neutrino_full"),
+            )
             wait_for_socket(sock)
 
         env = mode_env(
@@ -1007,9 +1174,13 @@ def build_summary(out_dir: Path, modes: List[str], args: argparse.Namespace, run
             "preset": args.preset,
             "baseline": "same workload without daemon, native CPython profile hook, or LD_PRELOAD hook",
             "weaver_full": "daemon + native CPython profile hook + LD_PRELOAD CUDA/NCCL launch hook; the default selective CUDA hook records GPU start/end for GEMM/NCCL/sync, records metadata-useful kernels by name only, and drops very low-value launches",
+            "weaver_triggered_py_only": "daemon + adaptive Python signal handler only; no continuous CPython profile hook is installed, and the workload sends synthetic extra-kernel triggers for layer ablation",
+            "weaver_neutrino_warp_only": "daemon + unchanged LD_PRELOAD CUDA/NCCL hook + Neutrino-style binary capture/disassembly sidecar; compare with weaver_kernel_only for incremental warp-layer cost",
+            "weaver_adaptive_neutrino_full": "daemon + unchanged LD_PRELOAD CUDA/NCCL hook + adaptive Python operator sampling after trigger_full extra kernels + Neutrino-style disassembly",
             "steady_state": "warmup iterations are excluded from step-level overhead; kernel slowdown uses timed kernel_launch events written by the hook",
             "primary_metric": "median host_step_ms overhead vs baseline",
             "secondary_metrics": ["gpu_step_ms", "p95 host_step_ms", "event_count", "event_bytes", "per_kernel_gpu_duration_slowdown"],
+            "extra_kernel": "when --inject-extra-kernel is enabled, every mode runs the same added layout/copy kernel; only adaptive Weaver modes use it to trigger Python operator sampling",
             "per_kernel_slowdown": (
                 "baseline does not expose per-kernel durations, so exact per-kernel before/after "
                 "comparison uses torch_profiler CUDA kernel trace as the before/reference source "
@@ -1058,6 +1229,8 @@ def write_markdown(path: Path, summary: Dict[str, object], modes: List[str]) -> 
         "Interpretation:",
         "- The main claim should use `weaver_full` host median overhead versus `baseline`.",
         "- Default Weaver modes use selective CUDA Event timing: GEMM/NCCL/sync are timed, metadata-useful kernels are name-only, and very low-value high-frequency kernels are dropped.",
+        "- Adaptive modes replace continuous Python profiling with signal-triggered operator stack samples emitted only after extra-kernel triggers.",
+        "- `weaver_neutrino_warp_only` still needs the launch hook because Neutrino-style warp/block data starts from captured CUDA launch metadata and binaries.",
         "- Per-kernel slowdown is written to `kernel_slowdown.json` and `kernel_slowdown.md`.",
         "- `torch_profiler` is a reference diagnostic tool; the normal Weaver path should be below it.",
     ]
@@ -1083,7 +1256,7 @@ def main() -> None:
             build_hook(args.python)
         if not HOOK.exists():
             raise FileNotFoundError(f"missing hook library: {HOOK}")
-    if any(mode in {"weaver_full", "weaver_no_disasm", "weaver_py_only"} for mode in modes):
+    if any(is_classic_python_profile_mode(mode) for mode in modes):
         if not args.skip_native_build:
             build_native_python_trace(args.python)
         native_ext = native_python_trace_path(args.python)

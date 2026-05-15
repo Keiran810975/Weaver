@@ -48,6 +48,62 @@ class EventStore:
             return list(self._tail)[-n:]
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) in ("1", "true", "TRUE", "on", "ON")
+
+
+def _parse_signal_number(value: str) -> int:
+    text = str(value or "SIGUSR1").strip()
+    if text.isdigit():
+        return int(text)
+    name = text.upper()
+    if not name.startswith("SIG"):
+        name = "SIG" + name
+    number = getattr(signal, name, None)
+    if number is None:
+        raise ValueError(f"unknown signal for WEAVER_ADAPTIVE_PY_SIGNAL: {value!r}")
+    return int(number)
+
+
+class AdaptivePythonSignaler:
+    """Signal the target Python process after the hook reports an extra kernel."""
+
+    def __init__(self):
+        self.enabled = _env_flag("WEAVER_DAEMON_ADAPTIVE_PY_SIGNAL", "0")
+        self.signal_number = _parse_signal_number(os.environ.get("WEAVER_ADAPTIVE_PY_SIGNAL", "SIGUSR1"))
+        self.min_interval_ns = max(0, int(os.environ.get("WEAVER_ADAPTIVE_PY_SIGNAL_MIN_INTERVAL_NS", "1000000")))
+        self._last_sent_ns: Dict[int, int] = {}
+
+    def maybe_signal(self, evt: dict) -> None:
+        if not self.enabled or not self._is_extra_kernel_event(evt):
+            return
+        pid = int(evt.get("pid") or 0)
+        if pid <= 0 or pid == os.getpid():
+            return
+        now = time.time_ns()
+        last = self._last_sent_ns.get(pid, 0)
+        if self.min_interval_ns and now - last < self.min_interval_ns:
+            return
+        try:
+            os.kill(pid, self.signal_number)
+            self._last_sent_ns[pid] = now
+        except OSError:
+            return
+
+    @staticmethod
+    def _is_extra_kernel_event(evt: dict) -> bool:
+        if evt.get("layer") != "cuda" or evt.get("kind") != "kernel_launch":
+            return False
+        payload = evt.get("payload") or {}
+        capture_mode = str(payload.get("capture_mode", "")).lower()
+        trigger_reason = str(payload.get("trigger_reason", "")).lower()
+        if capture_mode == "trigger_full":
+            return True
+        if trigger_reason in ("sequence_mismatch", "unexpected_kernel_name"):
+            return True
+        return False
+
+
 class WeaverDatagramServer:
     def __init__(self, sock_path: str, store: EventStore, out_file: Optional[str]):
         self.sock_path = sock_path
@@ -58,6 +114,7 @@ class WeaverDatagramServer:
         self._thread: Optional[threading.Thread] = None
         self._writer_q: "queue.Queue[str]" = queue.Queue(maxsize=20000)
         self._writer_thread: Optional[threading.Thread] = None
+        self._adaptive_python = AdaptivePythonSignaler()
 
     def start(self):
         p = Path(self.sock_path)
@@ -108,6 +165,7 @@ class WeaverDatagramServer:
                     self._writer_q.put_nowait(json.dumps(evt, ensure_ascii=True))
                 except queue.Full:
                     pass
+            self._adaptive_python.maybe_signal(evt)
 
 
 class ApiHandler(BaseHTTPRequestHandler):

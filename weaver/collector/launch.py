@@ -182,6 +182,9 @@ def _start_daemon(args) -> subprocess.Popen:
     ]
     env = os.environ.copy()
     _prepend_env_path(env, "PYTHONPATH", str(_repo_root()))
+    if args.python_mode == "adaptive":
+        env["WEAVER_DAEMON_ADAPTIVE_PY_SIGNAL"] = "1"
+        env.setdefault("WEAVER_ADAPTIVE_PY_SIGNAL", "SIGUSR1")
     return subprocess.Popen(cmd, env=env)
 
 
@@ -198,25 +201,31 @@ def _wait_for_socket(sock: str, timeout_s: float = 5.0) -> None:
 def _target_env(args) -> dict:
     env = os.environ.copy()
     env["WEAVER_SOCK"] = args.sock
-    env["WEAVER_AUTO_PROFILE"] = "1"
-    env.setdefault("WEAVER_PYTHON_COLLECTOR", "native")
-    env.setdefault("WEAVER_REQUIRE_NATIVE_PY", "1")
-    env.setdefault(
-        "WEAVER_PYTHON_TRACE_FUNCS",
-        ",".join(
-            [
-                "torch.utils.data.dataloader@_BaseDataLoaderIter@__next__",
-                "torch@cuda@synchronize",
-                "torch.cuda@Event@synchronize",
-                "torch.cuda@Event@wait",
-                "torch.cuda@Stream@synchronize",
-                "torch.cuda@Stream@wait_event",
-                "torch.cuda@Stream@wait_stream",
-                "torch@autograd@backward",
-                "torch@autograd@grad",
-            ]
-        ),
+    default_targets = ",".join(
+        [
+            "torch.utils.data.dataloader@_BaseDataLoaderIter@__next__",
+            "torch@cuda@synchronize",
+            "torch.cuda@Event@synchronize",
+            "torch.cuda@Event@wait",
+            "torch.cuda@Stream@synchronize",
+            "torch.cuda@Stream@wait_event",
+            "torch.cuda@Stream@wait_stream",
+            "torch@autograd@backward",
+            "torch@autograd@grad",
+        ]
     )
+    if args.python_mode == "off":
+        env["WEAVER_AUTO_PROFILE"] = "0"
+    elif args.python_mode == "adaptive":
+        env["WEAVER_AUTO_PROFILE"] = "1"
+        env["WEAVER_PYTHON_ADAPTIVE"] = "1"
+        env.setdefault("WEAVER_ADAPTIVE_PY_SIGNAL", "SIGUSR1")
+        env.setdefault("WEAVER_PYTHON_TRACE_FUNCS", default_targets)
+    else:
+        env["WEAVER_AUTO_PROFILE"] = "1"
+        env.setdefault("WEAVER_PYTHON_COLLECTOR", "native")
+        env.setdefault("WEAVER_REQUIRE_NATIVE_PY", "1")
+        env.setdefault("WEAVER_PYTHON_TRACE_FUNCS", default_targets)
     env.setdefault("WEAVER_COLLECTION_MODE", args.collection_mode)
     env.setdefault("WEAVER_TRIGGER_CAPTURE_AFTER", str(max(0, args.trigger_capture_after)))
     patterns = []
@@ -230,12 +239,12 @@ def _target_env(args) -> dict:
         env["WEAVER_EXPECTED_SEQUENCE"] = "\n".join(sequence)
     env.setdefault("WEAVER_CUDA_EVENTS", "1")
     env.setdefault("WEAVER_CUDA_SYNC_ANCHOR", "1")
-    env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", "1")
-    env.setdefault("WEAVER_EMIT_CODE_EVENTS", "0")
+    env.setdefault("WEAVER_PYTHON_EVENT_BUDGET", "0" if args.python_mode == "adaptive" else "1")
+    env.setdefault("WEAVER_EMIT_CODE_EVENTS", "1" if args.warp_mode == "neutrino" else "0")
     env.setdefault("WEAVER_ASYNC_LAUNCH_EMIT", "1")
     env.setdefault("WEAVER_PATCH_DLSYM", "0")
     env.setdefault("WEAVER_PATCH_GETPROC", "1")
-    env.setdefault("WEAVER_ENABLE_DISASM", "0")
+    env.setdefault("WEAVER_ENABLE_DISASM", "1" if args.warp_mode == "neutrino" else "0")
     env.setdefault("WEAVER_TRACE_DIR", str(Path(args.out).resolve().parent))
     _prepend_env_path(env, "PYTHONPATH", str(_repo_root()))
     if args.hook:
@@ -271,6 +280,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=int,
         default=int(os.environ.get("WEAVER_TRIGGER_CAPTURE_AFTER", "2")),
         help="number of launches after an unexpected kernel to capture with CUDA Event timing",
+    )
+    parser.add_argument(
+        "--python-mode",
+        choices=["adaptive", "profile", "off"],
+        default=os.environ.get("WEAVER_PYTHON_MODE", "adaptive"),
+        help="adaptive samples Python operators only after extra-kernel triggers; profile uses the continuous CPython profile hook",
+    )
+    parser.add_argument(
+        "--warp-mode",
+        choices=["neutrino", "launch", "off"],
+        default=os.environ.get("WEAVER_WARP_MODE", "neutrino"),
+        help="neutrino enables binary capture/disassembly; launch keeps only launch-derived block/warp metadata",
     )
     parser.add_argument("--no-daemon", action="store_true", help="use an already running daemon")
     parser.add_argument("cmd", nargs=argparse.REMAINDER, help="target command after --")

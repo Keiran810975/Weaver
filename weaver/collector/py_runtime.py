@@ -2,6 +2,7 @@ import atexit
 import gc
 import json
 import os
+import signal
 import socket
 import sys
 import threading
@@ -312,10 +313,180 @@ class NativePythonRuntimeCollector:
         self._native.resume()
 
 
-CollectorHandle = Union[PythonRuntimeCollector, NativePythonRuntimeCollector]
+class AdaptivePythonTriggerCollector:
+    """Operator sampler armed by daemon-side extra-kernel triggers.
+
+    This deliberately does not install a continuous CPython profile hook.  The
+    daemon sends a process signal after the CUDA hook reports an unexpected or
+    trigger-captured kernel, and the handler emits one operator attribution
+    sample from the current Python stack.
+    """
+
+    def __init__(self, config: Optional[PythonCollectorConfig] = None):
+        self.cfg = config or PythonCollectorConfig()
+        self.sender = _Sender(self.cfg.socket_path)
+        self._targets = tuple(t.strip().replace("@", ".") for t in self.cfg.targets if t.strip())
+        self._match_cache: Dict[object, bool] = {}
+        self._enabled = False
+        self._emitted_events = 0
+        self._signal_number = _parse_signal_number(os.environ.get("WEAVER_ADAPTIVE_PY_SIGNAL", "SIGUSR1"))
+        self._previous_handler = None
+
+    def _is_interesting(self, filename: str) -> bool:
+        if self.cfg.include_stdlib:
+            return True
+        if not filename:
+            return False
+        lower = filename.lower()
+        if "/site-packages/" in lower or "/lib/python" in lower:
+            return False
+        if "/weaver/collector/py_runtime.py" in lower or lower.endswith("/sitecustomize.py"):
+            return False
+        return True
+
+    def _frame_name(self, frame: FrameType) -> str:
+        code = frame.f_code
+        module = frame.f_globals.get("__name__", "")
+        qualname = code.co_qualname if hasattr(code, "co_qualname") else code.co_name
+        return f"{module}.{qualname}"
+
+    def _matches_target(self, frame: FrameType) -> bool:
+        code = frame.f_code
+        cached = self._match_cache.get(code)
+        if cached is not None:
+            return cached
+
+        if not self._targets:
+            matched = self._is_interesting(code.co_filename)
+            self._match_cache[code] = matched
+            return matched
+
+        full = self._frame_name(frame)
+        module = frame.f_globals.get("__name__", "")
+        func = code.co_name
+        matched = False
+        for target in self._targets:
+            if (
+                full == target
+                or full.endswith("." + target)
+                or module == target
+                or module.endswith("." + target)
+                or func == target
+            ):
+                matched = True
+                break
+        self._match_cache[code] = matched
+        return matched
+
+    def _select_frame(self, frame: Optional[FrameType]) -> Optional[FrameType]:
+        fallback = None
+        cur = frame
+        while cur is not None:
+            if self._matches_target(cur):
+                return cur
+            if fallback is None and self._is_interesting(cur.f_code.co_filename):
+                fallback = cur
+            cur = cur.f_back
+        return fallback
+
+    def _handler(self, signum: int, frame: Optional[FrameType]) -> None:
+        budget = max(0, int(self.cfg.event_budget))
+        if budget and self._emitted_events >= budget:
+            return
+        selected = self._select_frame(frame)
+        if selected is None:
+            return
+        now = time.time_ns()
+        code = selected.f_code
+        name = self._frame_name(selected)
+        self.sender.send(
+            {
+                "ts_ns": now,
+                "pid": os.getpid(),
+                "tid": threading.get_ident(),
+                "layer": "python",
+                "kind": "operator",
+                "source": "weaver_adaptive_py_trigger",
+                "operator_name": name,
+                "ts_end_ns": now,
+                "dur_ns": 0,
+                "payload": {
+                    "operator_name": name,
+                    "func": code.co_name,
+                    "qualname": getattr(code, "co_qualname", code.co_name),
+                    "file": code.co_filename,
+                    "line": selected.f_lineno,
+                    "module": selected.f_globals.get("__name__", ""),
+                    "trigger": "extra_kernel_signal",
+                    "signal": int(signum),
+                    "collector": "adaptive_signal_stack_sample",
+                },
+            }
+        )
+        self._emitted_events += 1
+
+    def start(self):
+        if self._enabled:
+            return
+        self._previous_handler = signal.getsignal(self._signal_number)
+        signal.signal(self._signal_number, self._handler)
+        self._enabled = True
+
+    def stop(self):
+        if not self._enabled:
+            return
+        try:
+            signal.signal(self._signal_number, self._previous_handler)
+        except Exception:
+            pass
+        self._enabled = False
+
+    def pause(self):
+        return
+
+    def resume(self):
+        return
+
+
+CollectorHandle = Union[PythonRuntimeCollector, NativePythonRuntimeCollector, AdaptivePythonTriggerCollector]
 
 
 _global_collector: Optional[CollectorHandle] = None
+
+
+def _parse_signal_number(value: str) -> int:
+    text = str(value or "SIGUSR1").strip()
+    if text.isdigit():
+        return int(text)
+    name = text.upper()
+    if not name.startswith("SIG"):
+        name = "SIG" + name
+    number = getattr(signal, name, None)
+    if number is None:
+        raise ValueError(f"unknown signal for WEAVER_ADAPTIVE_PY_SIGNAL: {value!r}")
+    return int(number)
+
+
+def enable_adaptive_python_trigger_collector(
+    socket_path: str = "/tmp/weaver.sock",
+    include_stdlib: bool = False,
+    targets: Tuple[str, ...] = (),
+    event_budget: int = 0,
+) -> CollectorHandle:
+    global _global_collector
+    if _global_collector is None:
+        cfg = PythonCollectorConfig(
+            socket_path=socket_path,
+            include_stdlib=include_stdlib,
+            targets=targets,
+            trace_gc=False,
+            emit_raw_calls=False,
+            event_budget=max(0, int(event_budget)),
+        )
+        _global_collector = AdaptivePythonTriggerCollector(cfg)
+        _global_collector.start()
+        atexit.register(_global_collector.stop)
+    return _global_collector
 
 
 def enable_python_collector(
@@ -367,6 +538,13 @@ def enable_from_env() -> Optional[CollectorHandle]:
         for item in os.environ.get("WEAVER_PYTHON_TRACE_FUNCS", "").split(",")
         if item.strip()
     )
+    if os.environ.get("WEAVER_PYTHON_ADAPTIVE", "0") in ("1", "true", "TRUE", "on", "ON"):
+        return enable_adaptive_python_trigger_collector(
+            socket_path=os.environ.get("WEAVER_SOCK", "/tmp/weaver.sock"),
+            include_stdlib=os.environ.get("WEAVER_PROFILE_INCLUDE_STDLIB", "0") in ("1", "true", "TRUE"),
+            targets=targets,
+            event_budget=max(0, int(os.environ.get("WEAVER_PYTHON_EVENT_BUDGET", "0"))),
+        )
     return enable_python_collector(
         socket_path=os.environ.get("WEAVER_SOCK", "/tmp/weaver.sock"),
         sample_rate=max(1, int(os.environ.get("WEAVER_PYTHON_SAMPLE_RATE", "1"))),
