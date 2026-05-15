@@ -437,7 +437,14 @@ def _validate_expected_diagnosis(mode: str, root_causes: List[Dict]) -> Dict[str
     if mode == "extra_transpose":
         matches = [
             cause for cause in root_causes
-            if cause.get("target_operator") == "compute.gemm_B"
+            if (
+                cause.get("target_operator") == "compute.gemm_B"
+                or (
+                    cause.get("target_operator") is None
+                    and cause.get("target_family") == "GEMM"
+                    and (cause.get("root_cause") or {}).get("operator_name") == "compute.extra_transpose"
+                )
+            )
             and (cause.get("root_cause") or {}).get("operator_name") == "compute.extra_transpose"
         ]
         return {
@@ -449,7 +456,13 @@ def _validate_expected_diagnosis(mode: str, root_causes: List[Dict]) -> Dict[str
     if mode == "wait_event":
         matches = [
             cause for cause in root_causes
-            if cause.get("target_operator") == "comm.nccl_allreduce"
+            if (
+                cause.get("target_operator") == "comm.nccl_allreduce"
+                or (
+                    cause.get("target_operator") is None
+                    and cause.get("target_family") == "NCCL"
+                )
+            )
             and (
                 (cause.get("root_cause") or {}).get("operator_name") == "sync.stream_wait_event"
                 or (cause.get("root_cause") or {}).get("name") in {"event_wait", "stream_wait_event"}

@@ -53,6 +53,8 @@ class CandidateDiscovery:
         """
         candidates = []
 
+        records = [r for r in records if self._is_diagnosable_target(r) or self._may_be_blocker(r)]
+
         # A. 结构偏离候选
         candidates.extend(self._find_structural_deviation_candidates(records, syncs or []))
 
@@ -70,9 +72,10 @@ class CandidateDiscovery:
         """发现结构偏离候选。"""
         candidates = []
 
-        # A1. 无法分类的 kernel
+        # A1. 无法分类的 kernel 作为 blocker 有价值，但作为 target 噪声太高，
+        # 尤其是 <runtime_kernel> 和初始化 kernel；不再直接提升为 target。
         for record in records:
-            if record.family == "UNKNOWN":
+            if record.family == "UNKNOWN" and record.operator_name and not self._has_manual_dependencies():
                 candidates.append(Candidate(
                     target_id=record.kid,
                     candidate_type="structural_deviation",
@@ -111,6 +114,8 @@ class CandidateDiscovery:
         for stream, kernels in by_stream.items():
             sorted_kernels = sorted(kernels, key=lambda k: k.gpu_start_ns or k.cpu_enqueue_start_ns or 0)
             for i, target in enumerate(sorted_kernels):
+                if not self._should_consider_structural_target(target):
+                    continue
                 deps = expected_dependencies_for_target(self.sketch, target)
                 if not deps:
                     continue
@@ -177,6 +182,8 @@ class CandidateDiscovery:
             sorted_kernels = sorted(kernels, key=lambda k: k.gpu_start_ns or k.cpu_enqueue_start_ns or 0)
 
             for i, target in enumerate(sorted_kernels):
+                if not self._should_consider_structural_target(target):
+                    continue
                 if i == 0:
                     continue
 
@@ -296,7 +303,13 @@ class CandidateDiscovery:
             if not following:
                 continue
             following.sort(key=lambda item: item[0])
-            gap, target = following[0]
+            target_item = next(
+                ((gap, kernel) for gap, kernel in following if self._should_consider_structural_target(kernel)),
+                None,
+            )
+            if target_item is None:
+                continue
+            gap, target = target_item
             if gap <= self.min_long_gap_ns:
                 candidates.append(Candidate(
                     target_id=target.kid,
@@ -320,6 +333,8 @@ class CandidateDiscovery:
         # 按 (family, tag) 分组
         groups = defaultdict(list)
         for record in records:
+            if not self._is_diagnosable_target(record):
+                continue
             if record.work_value and record.gpu_dur_ns:
                 key = (record.family, record.tag)
                 progress = record.progress()
@@ -369,6 +384,8 @@ class CandidateDiscovery:
         # 按 (family, tag, 时间窗口) 分组
         groups = defaultdict(list)
         for record in records:
+            if not self._is_diagnosable_target(record):
+                continue
             if record.rank is not None:
                 # 简化分组：按 family + tag + 100ms 时间窗口
                 ts = (record.gpu_start_ns or record.cpu_enqueue_start_ns or 0) // 100_000_000
@@ -416,6 +433,33 @@ class CandidateDiscovery:
             token in name or token in op
             for token in ("copy", "cast", "contiguous", "layout", "memset", "fill", "zero")
         )
+
+    def _has_manual_dependencies(self) -> bool:
+        return self.sketch is not None and bool(getattr(self.sketch, "expected_dependencies", None))
+
+    def _is_manual_dependency_target(self, record: KernelRecord) -> bool:
+        return bool(expected_dependencies_for_target(self.sketch, record))
+
+    def _should_consider_structural_target(self, record: KernelRecord) -> bool:
+        if not self._is_diagnosable_target(record):
+            return False
+        if self._has_manual_dependencies():
+            return self._is_manual_dependency_target(record)
+        return True
+
+    def _is_diagnosable_target(self, record: KernelRecord) -> bool:
+        if not record.kernel_name or record.kernel_name in {"<unknown>", "<runtime_kernel>"}:
+            return False
+        if record.family in {"UNKNOWN", "ELEMENTWISE"}:
+            return False
+        return True
+
+    def _may_be_blocker(self, record: KernelRecord) -> bool:
+        if record.operator_name:
+            return True
+        if record.family in {"GEMM", "NCCL", "MEMCPY", "REDUCTION"}:
+            return True
+        return False
 
     def _dedupe(self, candidates: List[Candidate]) -> List[Candidate]:
         """按 target/reason 合并候选，保留最高置信度和证据。"""

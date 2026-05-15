@@ -340,6 +340,8 @@ class TimelineNormalizer:
                 continue
             op = self._find_containing_operator(timestamp, kernel.rank, kernel.pid)
             if op is None:
+                op = self._find_nearby_operator(timestamp, kernel.rank, kernel.pid)
+            if op is None:
                 continue
             if not kernel.operator_name:
                 kernel.operator_name = op.operator_name
@@ -351,6 +353,8 @@ class TimelineNormalizer:
         for sync in self.sync_records:
             timestamp = sync.ts_start_ns
             op = self._find_containing_operator(timestamp, sync.rank, sync.pid)
+            if op is None:
+                op = self._find_nearby_operator(timestamp, sync.rank, sync.pid)
             if op is None:
                 continue
             sync.payload.setdefault("operator_name", op.operator_name)
@@ -377,3 +381,34 @@ class TimelineNormalizer:
             return None
         matches.sort(key=lambda item: ((item.ts_end_ns or item.ts_start_ns) - item.ts_start_ns, item.ts_start_ns))
         return matches[0]
+
+    def _find_nearby_operator(
+        self,
+        timestamp_ns: Optional[int],
+        rank: Optional[int],
+        pid: int,
+        max_gap_ns: int = 5_000_000,
+    ) -> Optional[OperatorRecord]:
+        """Fallback for low-overhead traces where hook timestamps sit just outside an operator scope."""
+        if timestamp_ns is None:
+            return None
+        candidates = []
+        for op in self.operator_records:
+            if op.pid and pid and op.pid != pid:
+                continue
+            if op.rank is not None and rank is not None and op.rank != rank:
+                continue
+            end_ns = op.ts_end_ns if op.ts_end_ns is not None else op.ts_start_ns
+            if timestamp_ns < op.ts_start_ns:
+                gap = op.ts_start_ns - timestamp_ns
+            elif timestamp_ns > end_ns:
+                gap = timestamp_ns - end_ns
+            else:
+                gap = 0
+            if gap <= max_gap_ns:
+                duration = end_ns - op.ts_start_ns
+                candidates.append((gap, duration, op.ts_start_ns, op))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        return candidates[0][3]
